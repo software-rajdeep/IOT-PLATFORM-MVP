@@ -1,0 +1,10 @@
+# Platform backend dependencies.
+# These are already present in the target environment (offline install).
+fastapi
+uvicorn
+psycopg2-binary
+bcrypt
+itsdangerous
+
+# Optional, only needed to talk to a REAL RS-485 sensor.
+# pyserial

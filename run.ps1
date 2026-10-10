@@ -1,0 +1,22 @@
+# Universal Industrial Platform — one-command dev run.
+# Creates/updates the database, then starts the API + SPA on http://127.0.0.1:8000
+param([switch]$Reset)
+
+$ErrorActionPreference = "Stop"
+$backend = Join-Path $PSScriptRoot "backend"
+
+Push-Location $backend
+try {
+    if ($Reset) {
+        Write-Host "Resetting database ucap_platform ..."
+        $env:PGPASSWORD = if ($env:PGPASSWORD) { $env:PGPASSWORD } else { "linux" }
+        psql -U postgres -h localhost -c "DROP DATABASE IF EXISTS ucap_platform;"
+    }
+    Write-Host "Applying schema + seed ..."
+    python scripts/init_db.py
+    Write-Host "Starting API on http://127.0.0.1:8000 ..."
+    python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+}
+finally {
+    Pop-Location
+}

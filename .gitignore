@@ -1,0 +1,19 @@
+# thickness-monitoring is a separate project with its own repository.
+thickness-monitoring/
+
+# secrets & local env
+.env
+backend/.env
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
