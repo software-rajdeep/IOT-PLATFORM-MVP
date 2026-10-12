@@ -3,7 +3,7 @@ import { store } from "./store.js";
 
 const BASE = "/api/v1";
 
-async function request(path, { method = "GET", body } = {}) {
+async function request(path, { method = "GET", body, raw = false } = {}) {
   const headers = {};
   const token = store.token();
   if (token) headers["Authorization"] = "Bearer " + token;
@@ -15,6 +15,7 @@ async function request(path, { method = "GET", body } = {}) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 
+  if (raw && res.ok) return res;
   const text = await res.text();
   let data = null;
   if (text) {
@@ -69,4 +70,35 @@ export const api = {
   dashboard: (id, deviceId) =>
     request(`/instances/${id}/dashboard` + (deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "")),
   measurements: (id, limit = 100) => request(`/instances/${id}/measurements?limit=${limit}`),
+
+  // catalog
+  solutions: () => request("/catalog/solutions"),
+  units: () => request("/catalog/units"),
+  template: (id) => request(`/catalog/templates/${encodeURIComponent(id)}`),
+
+  // sources
+  plants: () => request("/devices/plants"),
+  updateConnection: (id, data) => request(`/devices/${id}/connection`, { method: "PATCH", body: data }),
+  ingestInfo: (id) => request(`/devices/${id}/ingest-info`),
+
+  // onboarding steps
+  mapping: (id) => request(`/instances/${id}/mapping`),
+  captureSamples: (id) => request(`/instances/${id}/mapping/samples`, { method: "POST" }),
+  previewMapping: (id, definition, payload) =>
+    request(`/instances/${id}/mapping/preview`, { method: "POST", body: { definition, payload } }),
+  saveMapping: (id, definition) => request(`/instances/${id}/mapping`, { method: "POST", body: { definition } }),
+  mappingFailures: (id) => request(`/instances/${id}/mapping/failures`),
+  widgets: (id) => request(`/instances/${id}/widgets`),
+  saveLayout: (id, widgets) => request(`/instances/${id}/layout`, { method: "PUT", body: { widgets } }),
+  resetLayout: (id) => request(`/instances/${id}/layout`, { method: "DELETE" }),
+  checklist: (id) => request(`/instances/${id}/checklist`),
+
+  // operations
+  alerts: (id) => request(`/instances/${id}/alerts`),
+  ackAlert: (id, eventId) => request(`/instances/${id}/alerts/${eventId}/ack`, { method: "POST" }),
+  updateAlertRule: (id, type, data) => request(`/instances/${id}/alert-rules/${type}`, { method: "PUT", body: data }),
+  report: (id, date) => request(`/instances/${id}/report` + (date ? `?date=${date}` : "")),
+  history: (id) => request(`/instances/${id}/history`),
+  clone: (id, data) => request(`/instances/${id}/clone`, { method: "POST", body: data }),
+  exportCsv: (id, params) => request(`/instances/${id}/export.csv?` + new URLSearchParams(params), { raw: true }),
 };

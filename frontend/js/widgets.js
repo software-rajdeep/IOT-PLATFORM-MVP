@@ -1,0 +1,199 @@
+// Widget renderers. Each widget type (core.widget_types) renders from the generic dashboard
+// bundle (current / trend / statistics / quality / capability / groups / health / alerts),
+// using the template's label + unit — no widget knows it is "thickness".
+import { esc, fmt, shortTime } from "./ui.js";
+
+export const DEFAULT_TITLES = {
+  current_value: (d) => `Current ${d.label.toLowerCase()}`,
+  target_deviation: () => "Target & deviation",
+  pass_fail: () => "Quality",
+  statistics: () => "Statistics",
+  capability: () => "Process capability",
+  trend_band: (d) => `${d.label} over time`,
+  deviation_trend: () => "Deviation over time",
+  histogram: (d) => `${d.label} distribution`,
+  recent_bars: () => "Recent readings",
+  group_summary: () => "Per-product summary",
+  speed_scatter: (d) => `${d.label} vs line speed`,
+  device_health: () => "Source health",
+  calibration_status: () => "Calibration",
+  limits_editor: () => "Limits",
+  alerts_list: () => "Alerts",
+  history_table: () => "Reading history",
+};
+
+// Widgets that hold user input are drawn once, not on every live refresh.
+export const STATIC_WIDGETS = new Set(["limits_editor"]);
+
+const cls = (status) => (status === "FAIL" ? "bad" : status === "PASS" ? "good" : "muted");
+const W = 720;
+
+function bounds(values, extra = []) {
+  const all = [...values, ...extra].filter((v) => v != null && Number.isFinite(v));
+  let min = Math.min(...all), max = Math.max(...all);
+  if (!all.length) { min = 0; max = 1; }
+  if (max - min < 1e-6) { min -= 0.5; max += 0.5; }
+  const pad = (max - min) * 0.08;
+  return [min - pad, max + pad];
+}
+
+function hline(y, color, h) {
+  return `<line x1="0" y1="${y.toFixed(1)}" x2="${W}" y2="${y.toFixed(1)}" stroke="${color}" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/>`;
+}
+
+function svg(h, inner, axis = "") {
+  return `<svg class="wchart" viewBox="0 0 ${W} ${h}" preserveAspectRatio="none">${inner}</svg>${axis}`;
+}
+
+function lineChart(points, key, refs, h = 200) {
+  const pts = points.filter((p) => p[key] != null);
+  if (pts.length < 2) return `<div class="empty">waiting for data…</div>`;
+  const [min, max] = bounds(pts.map((p) => p[key]), refs.map((r) => r.v));
+  const X = (i) => (i / (pts.length - 1)) * W;
+  const Y = (v) => h - ((v - min) / (max - min)) * h;
+  const line = pts.map((p, i) => `${X(i).toFixed(1)},${Y(p[key]).toFixed(1)}`).join(" ");
+  const dots = pts.map((p, i) => p.status === "FAIL"
+    ? `<circle cx="${X(i).toFixed(1)}" cy="${Y(p[key]).toFixed(1)}" r="3" fill="var(--bad)"/>` : "").join("");
+  const lines = refs.filter((r) => r.v != null).map((r) => hline(Y(r.v), r.color, h)).join("");
+  const axis = `<div class="waxis"><span>${fmt(max, 3)}</span><span>${shortTime(pts[0].ts)} → ${shortTime(pts[pts.length - 1].ts)}</span><span>${fmt(min, 3)}</span></div>`;
+  return svg(h, `${lines}<polyline fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke" points="${line}"/>${dots}`, axis);
+}
+
+function histogram(points, lower, upper, target, h = 200) {
+  const vals = points.map((p) => p.value).filter((v) => v != null);
+  if (vals.length < 5) return `<div class="empty">collecting samples…</div>`;
+  const bins = 20;
+  let [lo, hi] = bounds(vals, [lower, upper]);
+  const span = hi - lo;
+  const counts = new Array(bins).fill(0);
+  vals.forEach((v) => { counts[Math.min(bins - 1, Math.max(0, Math.floor(((v - lo) / span) * bins)))]++; });
+  const maxC = Math.max(...counts);
+  const bw = W / bins;
+  const bars = counts.map((c, i) => {
+    const hh = (c / maxC) * (h - 6);
+    const centre = lo + ((i + 0.5) / bins) * span;
+    const ok = (lower == null || centre >= lower) && (upper == null || centre <= upper);
+    return `<rect x="${(i * bw + 1).toFixed(1)}" y="${(h - hh).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${hh.toFixed(1)}" fill="${ok ? "rgba(22,199,154,.75)" : "rgba(255,93,93,.8)"}" rx="1"/>`;
+  }).join("");
+  const vx = (v) => (((v - lo) / span) * W).toFixed(1);
+  const marks = [[lower, "var(--bad)"], [upper, "var(--bad)"], [target, "var(--muted)"]].filter(([v]) => v != null)
+    .map(([v, c]) => `<line x1="${vx(v)}" y1="0" x2="${vx(v)}" y2="${h}" stroke="${c}" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/>`).join("");
+  return svg(h, bars + marks, `<div class="waxis"><span>${fmt(lo)}</span><span>${vals.length} samples</span><span>${fmt(hi)}</span></div>`);
+}
+
+function bars(points, lower, upper, target, h = 200) {
+  const pts = points.filter((p) => p.value != null).slice(-60);
+  if (pts.length < 2) return `<div class="empty">waiting for data…</div>`;
+  const [min, max] = bounds(pts.map((p) => p.value), [lower, upper, target]);
+  const Y = (v) => h - ((v - min) / (max - min)) * h;
+  const bw = W / pts.length;
+  const rects = pts.map((p, i) => `<rect x="${(i * bw + 0.5).toFixed(1)}" y="${Y(p.value).toFixed(1)}" width="${(bw - 1.5).toFixed(1)}"
+    height="${(h - Y(p.value)).toFixed(1)}" fill="${p.status === "FAIL" ? "rgba(255,93,93,.85)" : "rgba(22,199,154,.8)"}" rx="1"/>`).join("");
+  const refs = [[lower, "var(--bad)"], [upper, "var(--bad)"], [target, "var(--muted)"]].filter(([v]) => v != null).map(([v, c]) => hline(Y(v), c, h)).join("");
+  return svg(h, refs + rects);
+}
+
+function scatter(points, lower, upper, h = 200) {
+  const pts = points.filter((p) => p.value != null && p.speed != null);
+  if (pts.length < 3) return `<div class="empty">waiting for speed data…</div>`;
+  const [x0, x1] = bounds(pts.map((p) => p.speed));
+  const [y0, y1] = bounds(pts.map((p) => p.value), [lower, upper]);
+  const X = (v) => ((v - x0) / (x1 - x0)) * W;
+  const Y = (v) => h - ((v - y0) / (y1 - y0)) * h;
+  const dots = pts.map((p) => `<circle cx="${X(p.speed).toFixed(1)}" cy="${Y(p.value).toFixed(1)}" r="3.5" fill="${p.status === "FAIL" ? "var(--bad)" : "var(--accent)"}" opacity=".75"/>`).join("");
+  const refs = [lower, upper].filter((v) => v != null).map((v) => hline(Y(v), "var(--bad)", h)).join("");
+  return svg(h, refs + dots, `<div class="waxis"><span>${fmt(x0, 1)} m/min</span><span>line speed →</span><span>${fmt(x1, 1)} m/min</span></div>`);
+}
+
+function donut(pct) {
+  const r = 30, c = 2 * Math.PI * r, v = pct == null ? 0 : pct / 100;
+  return `<svg viewBox="0 0 80 80" class="donut"><circle cx="40" cy="40" r="${r}" fill="none" stroke="#33141a" stroke-width="10"/>
+    <circle cx="40" cy="40" r="${r}" fill="none" stroke="var(--good)" stroke-width="10" stroke-dasharray="${(c * v).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 40 40)"/>
+    <text x="40" y="45" text-anchor="middle" font-size="15" fill="var(--text)" font-family="var(--mono)">${pct == null ? "—" : Math.round(pct) + "%"}</text></svg>`;
+}
+
+export function renderWidget(type, d) {
+  const c = d.current || {}, s = d.statistics || {}, q = d.quality || {}, cfg = d.config || {};
+  const u = esc(d.unit || "");
+  switch (type) {
+    case "current_value":
+      return `<div class="big ${cls(c.status)}">${fmt(c.value)}<span class="u">${u}</span></div>
+        <div class="stat-sub"><span class="badge ${cls(c.status)}">${esc(c.status || "—")}</span> · ${esc(shortTime(c.ts))}
+        ${c.group ? ` · <span class="tag">${esc(c.group)}</span>` : ""}${c.speed != null ? ` · ${fmt(c.speed, 1)} m/min` : ""}</div>`;
+    case "target_deviation":
+      return `<div class="big">${fmt(cfg.target)}<span class="u">${u}</span></div>
+        <div class="stat-sub">deviation ${c.deviation == null ? "—" : (c.deviation > 0 ? "+" : "") + fmt(c.deviation)} ${u}
+        · band ${fmt(cfg.lower)} – ${fmt(cfg.upper)}</div>`;
+    case "pass_fail":
+      return `<div class="pf">${donut(q.pass_percentage)}<div class="stat-sub">
+        <span class="badge good">${q.pass_count || 0} pass</span><br/><span class="badge bad">${q.fail_count || 0} fail</span>
+        <br/>last ${s.samples || 0} readings</div></div>`;
+    case "statistics":
+      return `<div class="kv"><span>avg</span><b>${fmt(s.average)}</b><span>min</span><b>${fmt(s.minimum)}</b>
+        <span>max</span><b>${fmt(s.maximum)}</b><span>std dev</span><b>${fmt(s.std_dev, 4)}</b>
+        <span>samples</span><b>${s.samples || 0}</b></div>`;
+    case "capability": {
+      const cp = d.capability || {};
+      const grade = (v) => (v == null ? "muted" : v >= 1.33 ? "good" : v >= 1 ? "warn" : "bad");
+      return `<div class="cap"><div><span class="k">Cp</span><span class="big ${grade(cp.cp)}">${fmt(cp.cp, 2)}</span></div>
+        <div><span class="k">Cpk</span><span class="big ${grade(cp.cpk)}">${fmt(cp.cpk, 2)}</span></div></div>
+        <div class="stat-sub">≥ 1.33 capable · 1.0–1.33 marginal · &lt; 1.0 not capable</div>`;
+    }
+    case "trend_band":
+      return lineChart(d.trend || [], "value", [{ v: cfg.upper, color: "var(--bad)" }, { v: cfg.target, color: "var(--muted)" }, { v: cfg.lower, color: "var(--bad)" }]);
+    case "deviation_trend": {
+      const lo = cfg.lower != null && cfg.target != null ? cfg.lower - cfg.target : null;
+      const hi = cfg.upper != null && cfg.target != null ? cfg.upper - cfg.target : null;
+      return lineChart(d.trend || [], "deviation", [{ v: 0, color: "var(--muted)" }, { v: lo, color: "var(--bad)" }, { v: hi, color: "var(--bad)" }]);
+    }
+    case "histogram":
+      return histogram(d.trend || [], cfg.lower, cfg.upper, cfg.target);
+    case "recent_bars":
+      return bars(d.trend || [], cfg.lower, cfg.upper, cfg.target);
+    case "speed_scatter":
+      return scatter(d.trend || [], cfg.lower, cfg.upper);
+    case "group_summary":
+      return (d.groups || []).length ? `<table class="wtable"><thead><tr><th>Product</th><th class="td-r">n</th>
+        <th class="td-r">avg ${u}</th><th class="td-r">σ</th><th class="td-r">pass %</th></tr></thead><tbody>
+        ${d.groups.map((g) => `<tr><td class="td-mono">${esc(g.group)}</td><td class="td-r">${g.count}</td><td class="td-r td-mono">${fmt(g.average)}</td>
+          <td class="td-r td-mono">${fmt(g.std_dev, 4)}</td><td class="td-r">${g.pass_percentage == null ? "—" : g.pass_percentage + "%"}</td></tr>`).join("")}
+        </tbody></table>` : `<div class="empty">no product codes yet</div>`;
+    case "device_health": {
+      const h = d.device_health || {};
+      const on = h.communication === "ONLINE";
+      return `<div class="big" style="font-size:16px">${esc(h.model || h.device_id || "—")}</div>
+        <div class="stat-sub"><span class="badge ${on ? "good" : "bad"}">${esc(h.communication || "—")}</span>
+        · ${h.seconds_since == null ? "no data" : h.seconds_since + " s ago"} · ${esc((h.interface || "").toLowerCase())}</div>
+        ${h.last_error ? `<div class="stat-sub bad">${esc(h.last_error)}</div>` : ""}`;
+    }
+    case "calibration_status": {
+      const done = !!cfg["calibration.calibrated_at"];
+      return `<div class="cal-status-row"><span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : "not calibrated"}</span>
+        <button class="btn btn-sm" data-act="recalibrate">${done ? "Recalibrate" : "Calibrate"}</button></div>
+        <div class="stat-sub">${d.label.toLowerCase()} = ${fmt(cfg["calibration.scale"], 4)} × input + ${fmt(cfg["calibration.offset"], 4)}
+        ${done ? `<br/>by ${esc(cfg["calibration.calibrated_by"] || "")} · ${esc(new Date(cfg["calibration.calibrated_at"]).toLocaleString())}` : ""}</div>`;
+    }
+    case "limits_editor":
+      return `<div class="limits-row">
+        ${["target", "lower", "upper"].filter((k) => cfg.keys && cfg.keys[k]).map((k) => `<label><span class="limit-label">${k} ${u}</span>
+          <input class="limit-input" data-limit="${esc(cfg.keys[k])}" type="number" step="any" value="${cfg[k] ?? ""}"/></label>`).join("")}
+        <button class="btn btn-sm" data-act="save-limits">Save</button></div>`;
+    case "alerts_list":
+      return (d.alerts || []).length ? `<ul class="walerts">${d.alerts.map((a) => `<li class="${a.resolved_at ? "resolved" : ""}">
+        <span class="badge ${a.severity === "critical" ? "bad" : "warn"}">${esc(a.rule_type.replace("_", " "))}</span>
+        <span>${esc(a.message)}</span><span class="td-dim">${esc(shortTime(a.created_at))}${a.resolved_at ? " · resolved" : ""}</span>
+        ${!a.ack_at && !a.resolved_at ? `<button class="btn-ghost" data-ack="${a.event_id}">ack</button>` : ""}</li>`).join("")}</ul>`
+        : `<div class="empty">no alerts</div>`;
+    case "history_table": {
+      const rows = [...(d.trend || [])].reverse().slice(0, 60);
+      return rows.length ? `<table class="wtable"><thead><tr><th>Time</th><th class="td-r">${esc(d.label)} ${u}</th>
+        <th class="td-r">Deviation</th><th>Status</th>${rows.some((r) => r.group) ? "<th>Product</th>" : ""}</tr></thead><tbody>
+        ${rows.map((r) => `<tr><td class="td-mono td-dim">${esc(shortTime(r.ts))}</td><td class="td-mono td-r ${cls(r.status)}">${fmt(r.value)}</td>
+          <td class="td-mono td-r">${r.deviation == null ? "—" : fmt(r.deviation)}</td>
+          <td><span class="badge ${cls(r.status)}">${esc(r.status || "—")}</span></td>${r.group ? `<td class="td-mono">${esc(r.group)}</td>` : ""}</tr>`).join("")}
+        </tbody></table>` : `<div class="empty">waiting for readings…</div>`;
+    }
+    default:
+      return `<div class="empty">unknown widget ${esc(type)}</div>`;
+  }
+}

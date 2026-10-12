@@ -12,7 +12,7 @@ from ..db import execute, fetch_all, fetch_one, get_cursor
 from ..deps import get_current_user, require_company
 from ..services.calibration import compute_linear, current_displacement
 from ..services.dashboard import build_dashboard
-from ..services.devices import DEVICE_SELECT, load_device, serialize_device
+from ..services.devices import DEVICE_SELECT, load_device, resolve_plant, serialize_device
 from ..services.instances import get_instance, instance_device_ids, list_instances, load_config, serialize_instance, set_config
 from ..services import alerts, audit
 from ..services.mappings import ensure_initial_mapping
@@ -157,7 +157,7 @@ def create_instance(body: CreateInstanceRequest, user: dict = Depends(get_curren
                 (instance_id, template_id, company_id, plant_key, asset_id, device_id, name, status, created_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s)
             """,
-            (instance_id, body.template_id, company_id, body.plant_key or device.get("plant_key"),
+            (instance_id, body.template_id, company_id, resolve_plant(company_id, body.plant_key) or device.get("plant_key"),
              body.asset_id or device.get("asset_id"), body.device_id, body.name, user["id"]),
         )
         cur.execute(

@@ -44,7 +44,7 @@ export function renderLogin(view, ctx) {
     try {
       const result = await api.login(email, password);
       store.setSession(result.token, { user: result.user, company: result.company });
-      ctx.navigate("#/devices");
+      ctx.navigate("#/apps");
     } catch (err) {
       errorBox.innerHTML = `<div class="error-box">${esc(err.message)}</div>`;
       submit.disabled = false;

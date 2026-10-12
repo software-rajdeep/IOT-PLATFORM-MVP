@@ -118,7 +118,8 @@ def apply_migrations() -> None:
 
 
 def main() -> None:
-    print(f"[init_db] target = {settings.database_url}")
+    target = _split_dsn(settings.database_url)
+    print(f"[init_db] target = {target.get('host', 'localhost')}:{target.get('port', '5432')}/{target.get('dbname')}")
     ensure_database()
     ensure_customer_demo()
     apply_sql(DATABASE_DIR / "schema.sql")

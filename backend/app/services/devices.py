@@ -138,3 +138,25 @@ def serialize_device(row: dict) -> dict:
         },
         "signals": _json(row.get("signals"), []),
     }
+
+
+def resolve_plant(company_id: str, value: Optional[str]) -> Optional[str]:
+    """Plant key for a typed plant (matches the company's plants by key or name; creates new ones)."""
+    import re
+    from ..db import execute_returning
+    value = (value or "").strip()
+    if not value:
+        return None
+    row = fetch_one(
+        "SELECT plant_key FROM core.plants WHERE company_id = %s AND (upper(plant_key) = upper(%s) OR lower(plant_name) = lower(%s))",
+        (company_id, value, value))
+    if row:
+        return row["plant_key"]
+    base = re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")[:40] or "PLANT"
+    key, n = base, 1
+    while fetch_one("SELECT 1 FROM core.plants WHERE plant_key = %s", (key,)):
+        n += 1
+        key = f"{base}_{n}"
+    execute_returning("INSERT INTO core.plants (plant_key, company_id, plant_name) VALUES (%s, %s, %s) RETURNING plant_key",
+                      (key, company_id, value))
+    return key

@@ -10,20 +10,16 @@ M0-M6, acceptance test; proposal awaiting go-ahead).
 
 ## Origin and sync (important)
 
-- Source of truth was the **Dell laptop "SandeepLat"** (`C:\Users\admin\Documents\IoT Platform`). This dir is a
-  copy re-pulled 2026-10-12 (afternoon) via tar-over-SSH into a staging dir, diffed, then synced; verified identical (excluding `node_modules`, `dist`, `.venv`).
-- Laptop git: branch `main`, one commit `c520ccc`, remote `https://github.com/software-rajdeep/IOT-PLATFORM.git`
-  — **not accessible** from this Mac's `rajdeep-automation` login ("Repository not found"). Nothing here is committed;
-  ~20 files modified/deleted + new files (`database_api.py`, `demo_customer.py`, `customer_demo.sql`, `run.py`) are
-  uncommitted work carried over from the laptop (`calibration.js`/`limits.js` were deleted there; that UI moved into
-  the dashboard).
-- To push changes back to the laptop: SSH creds are in memory (`sandeeplat-laptop`). Tailnet must be
-  `software-rajdeep.github` and the laptop awake. Tar only the changed files over SSH. **Before pushing, re-pull
-  and diff to make sure nobody edited the laptop meanwhile, and confirm with the user** (it overwrites files).
-  Cmd.exe shell on the laptop (`dir`, not `ls`). Longer term: create a repo under `rajdeep-automation` so sync is via git.
-- `thickness-monitoring/` = separate Flask + React app (own docs: its `CLAUDE.md`, `HOW_IT_WORKS.md`, etc.).
-  Copied without `node_modules`/`dist` (run `npm install && npm run build` there). It has no `.git` locally and is
-  listed in the root `.gitignore`. `run-all.ps1` (Windows) starts UCAP :8000 + thickness-monitoring :5002 + demo feed.
+- Shared MVP repository: `https://github.com/rajdeep-automation/rajdeep-iot.git`, branch `main`, remote `origin`.
+- The original Dell folder is `C:\Users\admin\Documents\IoT Platform`; its remote is retained locally as
+  `laptop-origin` (`software-rajdeep/IOT-PLATFORM`). Do not overwrite or reset that folder.
+- A fresh SSH comparison on 2026-10-12 found nine files changed on the Dell since the Mac baseline `b1ede87`,
+  including opposite-sensor/reference-sensor processing and UI. Those changes are separate from this single-sensor MVP.
+- The completed MVP is delivered to a separate Dell checkout, `C:\Users\admin\Documents\IoT Platform MVP`.
+  Deployment details and test results live in `docs/DELIVERY.md`.
+- Before any future synchronization of the original folder, pull and compare its current files first. Keep its
+  uncommitted work and database. Credentials stay in local memory/environment, never in git.
+- `thickness-monitoring/` is a separate ignored Flask + React app, outside this MVP delivery.
 
 ## Layout
 
@@ -36,7 +32,7 @@ thickness-monitoring/                               separate app (see above)
 run.ps1 / run-all.ps1                               Windows launch scripts
 ```
 
-Recent (uncommitted) laptop work: "Customer database (API)" connection mode (`drivers/database_api.py`), a demo
+Baseline laptop work (now committed in the shared repo): "Customer database (API)" connection mode (`drivers/database_api.py`), a demo
 customer server + DB (`routers/demo_customer.py`, DB `ucap_customer_corp`), a much larger dashboard
 (`frontend/js/views/dashboard.js`), and updates to devices/instances/processing services.
 

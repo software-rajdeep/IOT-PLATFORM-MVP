@@ -57,21 +57,23 @@ CD22-35 RS485
 ## Onboarding flow (the app)
 
 ```
-Login
-  → Select device model (catalogue search)
-  → Select purpose
-  → Select application (rubber_thickness_v1)
-  → Device connection (gateway, RS-485 address, baud, poll; TEST DEVICE)
-  → Calibration (two known references → derive scale/offset)
-  → Quality limits (nominal / lower / upper)
-  → Activate
-  → Dashboard (Current, Target, Trend, Statistics, Quality, Device health)
+Login → My applications (resume drafts or open live dashboards)
+  → New solution (compatible device + application catalog)
+  → Asset & data source (gateway, customer API, database or HTTP push)
+  → Map data (preset or sample → paths, units, scale/offset, preview)
+  → Commission (two-point calibration + verification, input filter)
+  → Limits & alerts
+  → Graphs (available/locked widgets, drag/resize, saved per instance)
+  → Activate (checklist)
+  → Live dashboard → CSV export / shift report / clone / change history
 ```
 
 The customer dashboard never shows RS-485 addresses or registers — only
 thickness, target, pass rate and device health.
 
 ---
+
+Current implementation, validation and the separate Dell/Mac copies: [delivery notes](docs/DELIVERY.md).
 
 ## Requirements
 
@@ -167,3 +169,14 @@ backend/
 frontend/                         dependency-free SPA
 run.ps1
 ```
+
+## Verification
+
+From `backend/`, run `python -m pytest tests -q` (install `pytest` for development).
+With the demo API running, run `python scripts/e2e_mvp.py --base http://127.0.0.1:8000`.
+The acceptance script creates demo devices and instances for both seeded tenants; run it against a demo database.
+It covers gateway simulation, customer API pull, HTTP push, mapping errors, widget restrictions,
+layout persistence, cloning, CSV, reports, audit, tenant isolation, offline recovery and Generic Monitoring.
+
+`python backend/run.py` respects `APP_HOST` and `APP_PORT` from the environment or `backend/.env`.
+The vendored GridStack files and licenses support offline dashboard editing; charts use local SVG renderers.

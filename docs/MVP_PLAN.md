@@ -1,6 +1,6 @@
 # MVP Plan: one product, complete flow
 
-Status: **proposal, not started** (2026-10-12). Goal: a working, end-to-end example of what the final product looks
+Status: **MVP demo implemented and verified** (2026-10-12). See `DELIVERY.md` for the current implementation, checks, deployment locations and remaining scope. The review below records the starting state; it is not the current bug list. Goal: a working, end-to-end example of what the final product looks
 like, using one product. Every screen and backend mechanism should be the "real" design from `PRODUCT_FLOW.md`
 section 3, only with a small library behind it. When this works, adding product number 2 is data, not code.
 

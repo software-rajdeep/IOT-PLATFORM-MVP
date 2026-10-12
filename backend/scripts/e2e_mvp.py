@@ -209,7 +209,11 @@ def main(skip_offline: bool) -> int:
     check("clone: limits copied", clone["config"].get("thickness.lower_limit_mm") == "8.3")
 
     # ---------------------------------------------------------------- 7. export + report + audit
-    csv_text = call("GET", f"/api/v1/instances/{inst_x}/export.csv", xyz, raw=True)
+    # Polling is asynchronous: wait for two source rows before checking the export.
+    def csv_with_rows():
+        text = call("GET", f"/api/v1/instances/{inst_x}/export.csv", xyz, raw=True)
+        return text if len(text.strip().splitlines()) > 2 else None
+    csv_text = wait_for(csv_with_rows, 15) or call("GET", f"/api/v1/instances/{inst_x}/export.csv", xyz, raw=True)
     lines = csv_text.strip().splitlines()
     check("CSV export has header + rows", lines[0].startswith("timestamp,device_id") and len(lines) > 2, f"{len(lines) - 1} rows")
     rep = call("GET", f"/api/v1/instances/{inst_x}/report", xyz)
@@ -235,6 +239,18 @@ def main(skip_offline: bool) -> int:
         resolved = wait_for(lambda: all(a["resolved_at"] for a in call("GET", f"/api/v1/instances/{inst_a}/alerts", abc)["alerts"]
                                         if a["rule_type"] == "offline"), 20, 2)
         check("offline alert resolves when data returns", bool(resolved))
+
+    # Generic Monitoring must use the same source/runtime without thickness-specific UI.
+    generic = call("POST", "/api/v1/instances", abc, {"name": f"Generic monitoring {run}",
+                   "template_id": "generic_monitoring_v1", "device_id": dev["device_id"]})["instance_id"]
+    call("PATCH", f"/api/v1/instances/{generic}", abc, {"config": {
+        "signal.target": 1.5, "signal.lower_limit": 1.0, "signal.upper_limit": 2.0}})
+    generic_check = call("GET", f"/api/v1/instances/{generic}/checklist", abc)
+    check("Generic Monitoring needs no calibration", not any(i["key"] == "calibration" for i in generic_check["items"]))
+    call("POST", f"/api/v1/instances/{generic}/activate", abc)
+    generic_value = wait_for(lambda: call("GET", f"/api/v1/instances/{generic}/dashboard", abc)["current"]["value"], 15)
+    check("Generic Monitoring produces live values", generic_value is not None)
+    check("Generic Monitoring excludes calibration widgets", widget_status(abc, generic).get("calibration_status") == "not_applicable")
 
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

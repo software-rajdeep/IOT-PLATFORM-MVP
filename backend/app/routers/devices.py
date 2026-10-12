@@ -16,7 +16,8 @@ from ..services.calibration import current_displacement
 from ..config import settings
 from ..db import fetch_all
 from ..services.devices import (
-    _json, connector_config, connector_driver_key, list_devices, load_device, serialize_device, split_secrets,
+    _json, connector_config, connector_driver_key, list_devices, load_device, resolve_plant, serialize_device,
+    split_secrets,
 )
 from ..services.normalization import decode_displacement
 
@@ -119,7 +120,7 @@ def create_device(body: CreateDeviceRequest, user: dict = Depends(get_current_us
                  gateway_id, device_address, serial_number, ingest_key, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
             """,
-            (device_id, company_id, body.plant_key, body.asset_id, model["profile_id"], body.model_key,
+            (device_id, company_id, resolve_plant(company_id, body.plant_key), body.asset_id, model["profile_id"], body.model_key,
              body.gateway_id, body.device_address or conn.address, body.serial_number, ingest_key),
         )
         cur.execute(
@@ -161,6 +162,13 @@ def discover_source(body: DiscoverRequest, user: dict = Depends(get_current_user
         raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Discovery failed: {exc}")
+
+
+@router.get("/plants")
+def plants(user: dict = Depends(get_current_user)) -> dict:
+    company_id = require_company(user)
+    return {"plants": fetch_all("SELECT plant_key, plant_name, location FROM core.plants WHERE company_id = %s "
+                                "ORDER BY plant_name", (company_id,))}
 
 
 @router.get("")

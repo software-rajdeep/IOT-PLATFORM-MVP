@@ -1,5 +1,7 @@
 # UCAP — Status Review and Roadmap
 
+Historical baseline review: 2026-10-12. **Current MVP delivery status: [docs/DELIVERY.md](docs/DELIVERY.md).** Catalog compatibility, source polling, mapping, per-instance dashboards, alerts and reports have since been implemented. The gaps below describe the earlier baseline unless listed as remaining in the delivery note.
+
 Review date: 2026-10-12. Covers the code in this repo (laptop copy, uncommitted work included) measured against
 the design agreed with the team (the GPT design conversation: device profile, then template, then mapping, then
 telemetry, then dashboard). Read `README.md` first for the architecture.
