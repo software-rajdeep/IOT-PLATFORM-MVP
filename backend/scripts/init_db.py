@@ -93,12 +93,37 @@ def apply_sql(path: Path) -> None:
         conn.close()
 
 
+def apply_migrations() -> None:
+    """Apply database/migrations/NNN_*.sql in order, once each (tracked in core.schema_migrations)."""
+    conn = psycopg2.connect(settings.database_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS core.schema_migrations ("
+                "name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            cur.execute("SELECT name FROM core.schema_migrations")
+            done = {r[0] for r in cur.fetchall()}
+        conn.commit()
+        for path in sorted((DATABASE_DIR / "migrations").glob("*.sql")):
+            if path.name in done:
+                continue
+            with conn.cursor() as cur:
+                cur.execute(path.read_text(encoding="utf-8"))
+                cur.execute("INSERT INTO core.schema_migrations (name) VALUES (%s)", (path.name,))
+            conn.commit()
+            print(f"[init_db] migrated {path.name}")
+    finally:
+        conn.close()
+
+
 def main() -> None:
     print(f"[init_db] target = {settings.database_url}")
     ensure_database()
     ensure_customer_demo()
     apply_sql(DATABASE_DIR / "schema.sql")
     apply_sql(DATABASE_DIR / "seed.sql")
+    apply_migrations()
     print("[init_db] done")
 
 

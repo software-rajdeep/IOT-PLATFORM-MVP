@@ -44,6 +44,7 @@ from .base import DeviceDriver, DriverError
 from .registry import register
 
 DEFAULT_PORT = 5432
+MAX_RESPONSE_BYTES = 1_000_000
 
 # The target fields the platform can consume. Keys are TARGET field names.
 TARGET_FIELDS = ("measurement_raw", "timestamp", "device_id")
@@ -66,6 +67,15 @@ def _lookup(data: Any, path: str):
             except (KeyError, IndexError, TypeError):
                 return None
     return current
+
+
+def _json_safe(value: Any) -> Any:
+    from decimal import Decimal
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
 
 
 def quote_ident(name: str) -> str:
@@ -142,6 +152,11 @@ class DatabaseApiConnector(DeviceDriver):
             import psycopg2
         except ImportError as exc:  # pragma: no cover
             raise DriverError("psycopg2 is required for an internal database connection.") from exc
+        from ..services.source_guard import SourceBlocked, check_host
+        try:
+            check_host(self.host, self.port, self.database)
+        except SourceBlocked as exc:
+            raise DriverError(str(exc)) from exc
         return psycopg2.connect(
             host=self.host,
             port=self.port,
@@ -178,9 +193,14 @@ class DatabaseApiConnector(DeviceDriver):
         data = dict(zip(columns, row))
         return data
 
-    def _read_customer(self) -> dict:
+    def _fetch_json(self) -> Any:
         if not (self.api_url and self.api_key and self.api_secret):
             raise DriverError("Customer API connection requires api_url, api_key and api_secret.")
+        from ..services.source_guard import SourceBlocked, check_url
+        try:
+            check_url(self.api_url)
+        except SourceBlocked as exc:
+            raise DriverError(str(exc)) from exc
         headers = {
             "Accept": "application/json",
             "X-Api-Key": self.api_key,
@@ -190,9 +210,18 @@ class DatabaseApiConnector(DeviceDriver):
         req = urllib.request.Request(self.api_url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
-                payload = json.loads(response.read().decode("utf-8"))
+                body = response.read(MAX_RESPONSE_BYTES + 1)
         except Exception as exc:
             raise DriverError(f"Customer API request failed: {exc}") from exc
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise DriverError("Customer API response is larger than 1 MB")
+        try:
+            return json.loads(body.decode("utf-8"))
+        except ValueError as exc:
+            raise DriverError("Customer API did not return JSON") from exc
+
+    def _read_customer(self) -> dict:
+        payload = self._fetch_json()
 
         out: dict = {}
         for target in TARGET_FIELDS:
@@ -246,25 +275,37 @@ class DatabaseApiConnector(DeviceDriver):
         }
 
     def _discover_customer(self) -> dict:
-        if not (self.api_url and self.api_key and self.api_secret):
-            raise DriverError("Customer API discovery requires api_url, api_key and api_secret.")
-        headers = {
-            "Accept": "application/json",
-            "X-Api-Key": self.api_key,
-            "X-Api-Secret": self.api_secret,
-            "Authorization": f"Bearer {self.api_secret}",
-        }
-        req = urllib.request.Request(self.api_url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self._fetch_json()
         return {"mode": "customer", "sample": payload, "fields": _flatten_keys(payload)}
+
+    # -- full payload read: the mapping engine maps it (no field picked here) --
+    def read_payload(self) -> Optional[dict]:
+        """Latest record as a JSON-safe dict: the whole API response, or the whole newest row."""
+        if self.mode == "customer":
+            payload = self._fetch_json()
+            return payload if isinstance(payload, dict) else {"items": payload}
+        if not self.host or not self.database or not self.table:
+            raise DriverError("Database source requires host, database and table.")
+        order_col = self.order_by or self.mapping.get("timestamp")
+        order_clause = f" ORDER BY {quote_ident(order_col)} DESC" if order_col else ""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {quote_ident(self.table)}{order_clause} LIMIT 1")
+                row = cur.fetchone()
+                columns = [d[0] for d in cur.description] if cur.description else []
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {col: _json_safe(val) for col, val in zip(columns, row)}
 
     # -- driver contract ---------------------------------------------------
     def checkConnection(self) -> bool:  # noqa: N802
         if self.simulate:
             return True
         try:
-            return self._to_float(self._read_source().get("measurement_raw")) is not None
+            return bool(self.read_payload())
         except Exception:
             return False
 

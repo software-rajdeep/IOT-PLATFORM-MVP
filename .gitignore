@@ -19,3 +19,4 @@ venv/
 Thumbs.db
 # local screenshots
 Screenshot*.png
+.pytest_cache/

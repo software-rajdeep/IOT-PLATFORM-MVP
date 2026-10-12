@@ -12,10 +12,12 @@ SELECT
     d.profile_id, d.model_key, d.gateway_id, d.device_address,
     d.serial_number, d.ingest_key, d.status, d.last_seen, d.created_at,
     p.manufacturer, p.series, p.device_type, p.connector_type, p.decoding,
+    p.signals, p.preset_mapping,
     m.model_name, m.centre_distance, m.range_min, m.range_max, m.unit,
     m.resolution, m.spec,
     c.interface, c.baud_rate, c.address AS conn_address,
-    c.poll_interval_ms, c.connection_parameters
+    c.poll_interval_ms, c.connection_parameters, c.secrets,
+    c.last_error, c.last_error_at, c.last_cursor
 FROM core.devices d
 JOIN core.device_profiles p ON p.profile_id = d.profile_id
 JOIN core.device_models m ON m.model_key = d.model_key
@@ -42,9 +44,23 @@ def list_devices(company_id: str) -> list[dict]:
     return fetch_all(DEVICE_SELECT + " WHERE d.company_id = %s ORDER BY d.created_at DESC", (company_id,))
 
 
+SECRET_KEYS = ("password", "api_secret", "secret_key")
+
+
+def split_secrets(database: Optional[dict]) -> tuple[dict, dict]:
+    """Separate secret values from a database/API connection dict (secrets never leave the server)."""
+    public, secret = {}, {}
+    for key, value in (database or {}).items():
+        (secret if key in SECRET_KEYS else public)[key] = value
+    return public, {k: v for k, v in secret.items() if v not in (None, "")}
+
+
 def connector_config(device: dict) -> dict:
-    """Merge model + connection params into the connector's constructor input."""
+    """Merge model + connection params (+ server-side secrets) into the connector's constructor input."""
     params = _json(device.get("connection_parameters"), {})
+    secrets = _json(device.get("secrets"), {})
+    if params.get("database") is not None or secrets:
+        params = {**params, "database": {**(params.get("database") or {}), **secrets}}
     config = {
         "device_id": device.get("device_id"),
         "port": params.get("port"),
@@ -66,6 +82,8 @@ def connector_driver_key(device: dict) -> str:
     interface = str(device.get("interface") or "").strip().lower()
     if interface == "database_api":
         return "database_api"
+    if interface == "http_push":
+        return "http_push"
     return device.get("connector_type") or "cd22_rs485"
 
 
@@ -112,6 +130,11 @@ def serialize_device(row: dict) -> dict:
             "baud_rate": row.get("baud_rate"),
             "address": row.get("conn_address"),
             "poll_interval_ms": row.get("poll_interval_ms"),
-            "parameters": params,
+            "parameters": {k: v for k, v in params.items() if k != "database"} | (
+                {"database": {k: v for k, v in db.items() if k not in SECRET_KEYS}} if db else {}),
+            "secrets_set": sorted(_json(row.get("secrets"), {}).keys()),
+            "last_error": row.get("last_error"),
+            "last_error_at": row["last_error_at"].isoformat() if row.get("last_error_at") else None,
         },
+        "signals": _json(row.get("signals"), []),
     }

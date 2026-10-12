@@ -1,26 +1,43 @@
-"""Built-in connector simulator.
+"""Source runtime (grew out of the built-in connector simulator).
 
-Runs the REAL connector in simulation mode for every active device whose
-connection has simulate=true, then pushes the raw output through the exact same
-processing pipeline as a live gateway. Disable with ENABLE_SIMULATOR=0.
+Polls every active device on its own interval and pushes the raw payload through
+the processing pipeline — the same path a live gateway uses:
+
+    RS-485 CD22, simulate=true   -> the REAL connector in simulation mode (material tracks the target)
+    RS-485 CD22, real port       -> the connector over serial or TCP (serial-to-Ethernet)
+    database_api (API or DB)     -> the whole latest record, deduplicated, mapped by the mapping engine
+    http_push                    -> nothing to poll (POST /api/v1/ingest/{device_id})
+
+Failures are recorded on core.device_connections.last_error; offline alerts are
+checked every few seconds. Disable with ENABLE_POLLER=0 (ENABLE_SIMULATOR=0 skips
+simulated devices only).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from .db import fetch_all
+from .config import settings
+from .db import execute, fetch_all
 from .drivers import get_driver_class
+from .services import alerts
 from .services.devices import connector_config, connector_driver_key, load_device
 from .services.instances import instances_for_device, load_config
-from .services.processing import process_measurement
+from .services.processing import ingest_raw
 
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
+_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="source")
+_in_flight: set[str] = set()
+_next_due: dict[str, float] = {}
+_last_hash: dict[str, str] = {}
+_t0 = time.time()
+MIN_INTERVAL_S = 0.5
 
 
 def _as_dict(value) -> dict:
@@ -34,18 +51,12 @@ def _as_dict(value) -> dict:
         return {}
 
 
-def _simulated_device_ids() -> list[str]:
-    rows = fetch_all(
-        "SELECT d.device_id, c.connection_parameters FROM core.devices d "
+def _active_sources() -> list[dict]:
+    return fetch_all(
+        "SELECT d.device_id, c.interface, c.poll_interval_ms, c.connection_parameters FROM core.devices d "
         "LEFT JOIN core.device_connections c ON c.device_id = d.device_id "
-        "WHERE d.status = 'active'"
+        "WHERE d.status = 'active' AND coalesce(lower(c.interface), 'rs485') <> 'http_push'"
     )
-    ids = []
-    for row in rows:
-        params = _as_dict(row.get("connection_parameters"))
-        if params.get("simulate", True):
-            ids.append(row["device_id"])
-    return ids
 
 
 def _centre_displacement(device_id: str) -> Optional[float]:
@@ -67,42 +78,98 @@ def _centre_displacement(device_id: str) -> Optional[float]:
     return None
 
 
-def _loop(interval: float = 0.5) -> None:
-    t0 = time.time()
+def _record_error(device_id: str, message: Optional[str]) -> None:
+    if message:
+        execute("UPDATE core.device_connections SET last_error = %s, last_error_at = now() WHERE device_id = %s",
+                (message[:500], device_id))
+    else:
+        execute("UPDATE core.device_connections SET last_error = NULL WHERE device_id = %s AND last_error IS NOT NULL",
+                (device_id,))
+
+
+def poll_once(device_id: str) -> None:
+    device = load_device(device_id)
+    if not device:
+        return
+    connector_cls = get_driver_class(connector_driver_key(device))
+    if not connector_cls:
+        return
+    config = connector_config(device)
+    connector = connector_cls(config, {"centre_distance": device.get("centre_distance")})
+    try:
+        if connector.simulate:
+            centre = _centre_displacement(device_id)
+            t = time.time() - _t0
+            config["simulate_displacement_mm"] = (centre if centre is not None else 1.5) + 0.12 * math.sin(t / 6.0)
+            connector = connector_cls(config, {"centre_distance": device.get("centre_distance")})
+            payload = {"measurement_raw": connector.readMeasurement().get("measurement_raw")}
+        elif hasattr(connector, "read_payload"):
+            payload = connector.read_payload()
+            if not payload:
+                _record_error(device_id, "Source returned no record")
+                return
+            digest = hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+            if _last_hash.get(device_id) == digest:
+                return  # same record as last poll: nothing new
+            _last_hash[device_id] = digest
+            execute("UPDATE core.device_connections SET last_cursor = %s WHERE device_id = %s", (digest, device_id))
+        else:
+            reading = connector.readMeasurement()
+            if reading.get("measurement_raw") is None:
+                _record_error(device_id, "No response from sensor (check wiring, address and port)")
+                return
+            payload = {"measurement_raw": reading["measurement_raw"]}
+        ingest_raw(device_id, payload)
+        _record_error(device_id, None)
+    except Exception as exc:
+        _record_error(device_id, str(exc))
+    finally:
+        try:
+            connector.disconnect()
+        except Exception:
+            pass
+
+
+def _run(device_id: str) -> None:
+    try:
+        poll_once(device_id)
+    finally:
+        _in_flight.discard(device_id)
+
+
+def _loop() -> None:
+    last_offline_check = 0.0
     while not _stop.is_set():
-        started = time.monotonic()
-        for device_id in _simulated_device_ids():
-            try:
-                device = load_device(device_id)
-                if not device:
+        now = time.monotonic()
+        try:
+            for src in _active_sources():
+                params = _as_dict(src.get("connection_parameters"))
+                simulated = params.get("simulate", True)
+                if simulated and not settings.enable_simulator:
                     continue
-                connector_cls = get_driver_class(connector_driver_key(device))
-                if not connector_cls:
+                device_id = src["device_id"]
+                if device_id in _in_flight or now < _next_due.get(device_id, 0):
                     continue
-                config = connector_config(device)
-                centre = _centre_displacement(device_id)
-                if centre is None:
-                    centre = 1.5
-                # physical world: material at target thickness with slow drift + noise
-                t = time.time() - t0
-                config["simulate_displacement_mm"] = centre + 0.12 * math.sin(t / 6.0)
-                connector = connector_cls(config, {"centre_distance": device.get("centre_distance")})
-                reading = connector.readMeasurement()
-                process_measurement(device_id, reading.get("measurement_raw"))
-            except Exception as exc:
-                print(f"[simulator] device {device_id} failed: {exc}")
-        elapsed = time.monotonic() - started
-        _stop.wait(max(0.05, interval - elapsed))
+                interval = max(MIN_INTERVAL_S, (src.get("poll_interval_ms") or 1000) / 1000.0)
+                _next_due[device_id] = now + interval
+                _in_flight.add(device_id)
+                _pool.submit(_run, device_id)
+            if now - last_offline_check > 5:
+                last_offline_check = now
+                alerts.check_offline()
+        except Exception as exc:
+            print(f"[sources] loop error: {exc}")
+        _stop.wait(0.1)
 
 
-def start(interval: float = 0.5) -> None:
+def start() -> None:
     global _thread
     if _thread and _thread.is_alive():
         return
     _stop.clear()
-    _thread = threading.Thread(target=_loop, args=(interval,), name="connector-simulator", daemon=True)
+    _thread = threading.Thread(target=_loop, name="source-runtime", daemon=True)
     _thread.start()
-    print("[simulator] started")
+    print("[sources] runtime started")
 
 
 def stop() -> None:

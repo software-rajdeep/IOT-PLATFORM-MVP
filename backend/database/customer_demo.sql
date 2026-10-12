@@ -151,17 +151,22 @@ CREATE TABLE shopfloor.measurement_readings (
     reading_ts    TIMESTAMPTZ NOT NULL DEFAULT now(),
     raw_count     INTEGER,                 -- CD22 raw count  (mapped -> measurement_raw)
     value_mm      NUMERIC(16,6),           -- decoded displacement value (mm)
-    quality_flag  VARCHAR(16)
+    quality_flag  VARCHAR(16),
+    product_code  VARCHAR(32),             -- recipe running on the line
+    line_speed_mpm NUMERIC(8,2)            -- line speed (m/min)
 );
+CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON shopfloor.measurement_readings(device_code, reading_ts DESC);
 
-INSERT INTO shopfloor.measurement_readings (device_code, order_no, reading_ts, raw_count, value_mm, quality_flag)
+INSERT INTO shopfloor.measurement_readings (device_code, order_no, reading_ts, raw_count, value_mm, quality_flag, product_code, line_speed_mpm)
 SELECT
     'LASER_CD22_01',
     'PO-' || (1 + (lp / 100) % 40),
     now() - (interval '1 minute' * lp / 10),
     (140 + (random() * 120))::int,
     round((1.4 + random() * 1.2)::numeric, 6),
-    (ARRAY['OK','OK','OK','WARN'])[1 + lp % 4]
+    (ARRAY['OK','OK','OK','WARN'])[1 + lp % 4],
+    'RUB-EXTR-' || (1 + (lp / 300) % 3),
+    round((10 + random() * 6)::numeric, 2)
 FROM generate_series(1, 5000) AS lp;
 
 -- ---------------------------------------------------------------------------

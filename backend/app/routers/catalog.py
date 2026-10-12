@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..db import fetch_all, fetch_one
 from ..deps import get_current_user
+from ..services.compat import compatible
+from ..services.templates import parse_template
 
 router = APIRouter(prefix="/api/v1/catalog", tags=["catalog"])
 
@@ -84,21 +86,100 @@ def get_model(model_key: str, user: dict = Depends(get_current_user)) -> dict:
     return row
 
 
+def _model_signals(model_key: str) -> Optional[list]:
+    row = fetch_one(
+        "SELECT p.signals FROM core.device_models m JOIN core.device_profiles p ON p.profile_id = m.profile_id "
+        "WHERE m.model_key = %s", (model_key,))
+    return _json(row["signals"], []) if row else None
+
+
+def _compatible_templates(model_key: str) -> list[dict]:
+    signals = _model_signals(model_key) or []
+    rows = fetch_all(
+        "SELECT * FROM core.application_templates WHERE status = 'active' AND (model_key IS NULL OR model_key = %s) "
+        "ORDER BY sort_order", (model_key,))
+    return [t for t in (parse_template(r) for r in rows) if compatible(signals, t)]
+
+
 @router.get("/device-models/{model_key}/purposes")
 def purposes_for_model(model_key: str, user: dict = Depends(get_current_user)) -> dict:
+    """Purposes that have at least one application compatible with this product's signals."""
+    counts: dict = {}
+    for t in _compatible_templates(model_key):
+        counts[t["purpose_key"]] = counts.get(t["purpose_key"], 0) + 1
+    if not counts:
+        return {"purposes": []}
     rows = fetch_all(
-        """
-        SELECT p.purpose_key, p.name, p.description, p.icon, p.sort_order,
-               (SELECT count(*) FROM core.application_templates t
-                 WHERE t.purpose_key = p.purpose_key AND t.status = 'active') AS template_count
-        FROM core.device_model_purposes mp
-        JOIN core.purposes p ON p.purpose_key = mp.purpose_key
-        WHERE mp.model_key = %s AND p.status = 'active'
-        ORDER BY p.sort_order
-        """,
-        (model_key,),
+        "SELECT purpose_key, name, description, icon, sort_order FROM core.purposes "
+        "WHERE status = 'active' AND purpose_key = ANY(%s) ORDER BY sort_order",
+        (list(counts.keys()),),
     )
+    for r in rows:
+        r["template_count"] = counts[r["purpose_key"]]
     return {"purposes": rows}
+
+
+@router.get("/solutions")
+def solutions(user: dict = Depends(get_current_user)) -> dict:
+    """The solution catalog: every compatible (product, application) pair, plus curated listings.
+
+    Pairs are computed from device signals x application inputs; core.solution_listings only
+    adds presentation (title, subtitle, icon, order) and "coming soon" cards.
+    """
+    listings = fetch_all("SELECT * FROM core.solution_listings WHERE status <> 'hidden' ORDER BY sort_order")
+    by_pair = {(l["model_key"], l["template_id"]): l for l in listings if l["model_key"] and l["template_id"]}
+    models = fetch_all(
+        "SELECT m.model_key, m.model_name, m.centre_distance, m.range_min, m.range_max, m.unit, m.resolution, "
+        "p.profile_id, p.manufacturer, p.series, p.device_type, p.connector_type, p.signals "
+        "FROM core.device_models m JOIN core.device_profiles p ON p.profile_id = m.profile_id "
+        "WHERE m.status = 'active' AND p.status = 'active' ORDER BY p.manufacturer, m.centre_distance")
+    templates = [parse_template(r) for r in fetch_all(
+        "SELECT * FROM core.application_templates WHERE status = 'active' ORDER BY sort_order")]
+    out = []
+    for m in models:
+        signals = _json(m.pop("signals"), [])
+        m["signals"] = signals
+        for t in templates:
+            if t.get("model_key") and t["model_key"] != m["model_key"]:
+                continue
+            if not compatible(signals, t):
+                continue
+            listing = by_pair.get((m["model_key"], t["template_id"])) or {}
+            out.append({
+                "solution_id": f"{m['model_key']}:{t['template_id']}",
+                "status": "available",
+                "title": listing.get("title") or t["name"],
+                "subtitle": listing.get("subtitle") or t.get("description"),
+                "icon": listing.get("icon") or (t.get("category") == "monitoring" and "activity") or "layers",
+                "featured": bool(listing),
+                "sort_order": listing.get("sort_order", 500 + (t.get("sort_order") or 0)),
+                "model": m,
+                "template": {k: t.get(k) for k in ("template_id", "name", "version", "category", "purpose_key",
+                                                  "processor_key", "description", "requires", "optional",
+                                                  "outputs", "commissioning", "sensor_layout")},
+            })
+    for l in listings:
+        if l["status"] == "coming_soon":
+            out.append({"solution_id": l["listing_id"], "status": "coming_soon", "title": l["title"],
+                        "subtitle": l["subtitle"], "icon": l["icon"], "featured": False,
+                        "sort_order": 1000 + l["sort_order"],
+                        "model": {"model_name": l["product"]}, "template": {"name": l["application"]}})
+    out.sort(key=lambda x: (x["status"] != "available", not x["featured"], x["sort_order"], x["model"].get("model_name") or ""))
+    return {"solutions": out}
+
+
+@router.get("/widget-types")
+def widget_types(user: dict = Depends(get_current_user)) -> dict:
+    rows = fetch_all("SELECT * FROM core.widget_types ORDER BY sort_order")
+    for r in rows:
+        r["requires"] = _json(r.get("requires"), [])
+    return {"widget_types": rows}
+
+
+@router.get("/units")
+def list_units(user: dict = Depends(get_current_user)) -> dict:
+    rows = fetch_all("SELECT unit_key, label, dimension FROM core.units ORDER BY dimension, to_base_factor")
+    return {"units": rows}
 
 
 @router.get("/purposes/{purpose_key}/templates")
@@ -107,20 +188,16 @@ def templates_for_purpose(
     model_key: Optional[str] = Query(default=None),
     user: dict = Depends(get_current_user),
 ) -> dict:
-    sql = (
-        "SELECT template_id, name, version, category, sensor_layout, description, purpose_key, model_key, processor_key, "
-        "inputs, dashboard, sort_order FROM core.application_templates "
-        "WHERE purpose_key = %s AND status = 'active'"
-    )
+    sql = "SELECT * FROM core.application_templates WHERE purpose_key = %s AND status = 'active'"
     params: list = [purpose_key]
     if model_key:
         sql += " AND (model_key IS NULL OR model_key = %s)"
         params.append(model_key)
     sql += " ORDER BY sort_order"
-    rows = fetch_all(sql, params)
-    for r in rows:
-        r["inputs"] = _json(r.get("inputs"), [])
-        r["dashboard"] = _json(r.get("dashboard"), {})
+    rows = [parse_template(r) for r in fetch_all(sql, params)]
+    if model_key:
+        signals = _model_signals(model_key) or []
+        rows = [r for r in rows if compatible(signals, r)]
     return {"templates": rows}
 
 
@@ -129,8 +206,7 @@ def get_template(template_id: str, user: dict = Depends(get_current_user)) -> di
     row = fetch_one("SELECT * FROM core.application_templates WHERE template_id = %s", (template_id,))
     if not row:
         raise HTTPException(status_code=404, detail="Template not found")
-    row["inputs"] = _json(row.get("inputs"), [])
-    row["dashboard"] = _json(row.get("dashboard"), {})
+    row = parse_template(row)
     row["fields"] = fetch_all(
         "SELECT field_key, source, data_type, unit FROM core.template_fields "
         "WHERE template_id = %s ORDER BY sort_order",

@@ -49,6 +49,13 @@ class Settings:
     app_host: str = os.environ.get("APP_HOST", "127.0.0.1")
     app_port: int = int(os.environ.get("APP_PORT", "8000"))
     enable_simulator: bool = _bool("ENABLE_SIMULATOR", True)
+    # Source runtime: polls every active device/source (real and simulated).
+    enable_poller: bool = _bool("ENABLE_POLLER", True)
+    # Demo customer system writes a live reading every second into its own DB.
+    enable_demo_customer: bool = _bool("ENABLE_DEMO_CUSTOMER", True)
+    # Allow customer sources on private/loopback addresses (dev, LAN gateways).
+    allow_private_sources: bool = _bool("ALLOW_PRIVATE_SOURCES", True)
+    public_base_url: str = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 
 
 settings = Settings()

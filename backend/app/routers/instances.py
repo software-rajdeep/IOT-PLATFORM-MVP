@@ -14,6 +14,9 @@ from ..services.calibration import compute_linear, current_displacement
 from ..services.dashboard import build_dashboard
 from ..services.devices import DEVICE_SELECT, load_device, serialize_device
 from ..services.instances import get_instance, instance_device_ids, list_instances, load_config, serialize_instance, set_config
+from ..services import alerts, audit
+from ..services.mappings import ensure_initial_mapping
+from ..services.templates import load_template
 
 router = APIRouter(prefix="/api/v1/instances", tags=["instances"])
 
@@ -171,6 +174,10 @@ def create_instance(body: CreateInstanceRequest, user: dict = Depends(get_curren
     if defaults:
         set_config(instance_id, defaults)
 
+    tpl = load_template(body.template_id)
+    ensure_initial_mapping(instance_id, body.device_id, tpl, user["id"])
+    alerts.ensure_rules(instance_id, tpl)
+    audit.log(user, "instance.create", "instance", instance_id, None, {"template": body.template_id, "device": body.device_id})
     return serialize_instance(get_instance(instance_id, company_id))
 
 
@@ -195,7 +202,11 @@ def update_instance(instance_id: str, body: UpdateInstanceRequest, user: dict = 
             (body.name, body.status, instance_id, company_id),
         )
     if body.config:
+        before = load_config(instance_id)
         set_config(instance_id, body.config)
+        changed = {k: v for k, v in body.config.items() if not k.startswith("ui.") and str(before.get(k)) != str(v)}
+        if changed:
+            audit.log(user, "config.update", "instance", instance_id, {k: before.get(k) for k in changed}, changed)
     return serialize_instance(get_instance(instance_id, company_id))
 
 
@@ -221,6 +232,7 @@ def calibrate(instance_id: str, body: CalibrateRequest, user: dict = Depends(get
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    before = load_config(instance_id)
     set_config(instance_id, {
         "calibration.scale": scale,
         "calibration.offset": offset,
@@ -228,9 +240,13 @@ def calibrate(instance_id: str, body: CalibrateRequest, user: dict = Depends(get
         "calibration.reference_1_displacement": d1,
         "calibration.reference_2_thickness": body.reference_2_thickness,
         "calibration.reference_2_displacement": d2,
-        "calibration.calibrated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        "calibration.calibrated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "calibration.calibrated_by": user["username"],
     })
+    audit.log(user, "calibration.save", "instance", instance_id,
+              {"scale": before.get("calibration.scale"), "offset": before.get("calibration.offset"),
+               "calibrated_at": before.get("calibration.calibrated_at")},
+              {"scale": scale, "offset": offset, "references": [[body.reference_1_thickness, d1], [body.reference_2_thickness, d2]]})
     return {"calibration.scale": scale, "calibration.offset": offset,
             "reference_1_displacement": d1, "reference_2_displacement": d2}
 
@@ -266,8 +282,14 @@ def verify_calibration(instance_id: str, body: VerifyCalibrationRequest, user: d
 
 @router.post("/{instance_id}/activate")
 def activate(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    from .instance_setup import checklist
     company_id = require_company(user)
-    _owned(instance_id, user)
+    row = _owned(instance_id, user)
+    items = checklist(instance_id, row, load_template(row["template_id"]))
+    blocking = [i["label"] for i in items if i["required"] and not i["ok"]]
+    if blocking:
+        raise HTTPException(status_code=400, detail="Not ready to activate: " + "; ".join(blocking))
+    audit.log(user, "instance.activate", "instance", instance_id)
     execute("UPDATE core.template_instances SET status = 'active', updated_at = now() "
             "WHERE instance_id = %s AND company_id = %s", (instance_id, company_id))
     return serialize_instance(get_instance(instance_id, company_id))
@@ -303,3 +325,142 @@ def measurements(
             if r.get(k) is not None:
                 r[k] = float(r[k])
     return {"measurements": rows}
+
+
+# ------------------------------------------------------------------ alerts
+@router.get("/{instance_id}/alerts")
+def list_alerts(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _owned(instance_id, user)
+    return {"alerts": alerts.list_events(instance_id, 100), "rules": alerts.rules(instance_id)}
+
+
+@router.post("/{instance_id}/alerts/{event_id}/ack")
+def ack_alert(instance_id: str, event_id: int, user: dict = Depends(get_current_user)) -> dict:
+    _owned(instance_id, user)
+    alerts.acknowledge(instance_id, event_id, user["username"])
+    return {"ok": True}
+
+
+class AlertRuleRequest(BaseModel):
+    enabled: Optional[bool] = None
+    params: Optional[dict] = None
+
+
+@router.put("/{instance_id}/alert-rules/{rule_type}")
+def update_alert_rule(instance_id: str, rule_type: str, body: AlertRuleRequest,
+                      user: dict = Depends(get_current_user)) -> dict:
+    _owned(instance_id, user)
+    if rule_type not in ("fail_streak", "offline", "mapping_failure"):
+        raise HTTPException(status_code=400, detail="Unknown alert rule")
+    execute(
+        "INSERT INTO core.alert_rules (instance_id, rule_type, params, enabled) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT (instance_id, rule_type) DO UPDATE SET "
+        "params = COALESCE(%s, core.alert_rules.params), enabled = COALESCE(%s, core.alert_rules.enabled)",
+        (instance_id, rule_type, json.dumps(body.params or {}), body.enabled if body.enabled is not None else True,
+         json.dumps(body.params) if body.params is not None else None, body.enabled),
+    )
+    audit.log(user, "alert_rule.update", "instance", instance_id, None, {rule_type: body.model_dump()})
+    return {"rules": alerts.rules(instance_id)}
+
+
+# ------------------------------------------------------------------ export + reports
+@router.get("/{instance_id}/export.csv")
+def export_csv(instance_id: str, start: Optional[datetime] = None, end: Optional[datetime] = None,
+               device_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    from fastapi.responses import StreamingResponse
+    from ..services.reports import export_csv as rows
+    row = _owned(instance_id, user)
+    template = load_template(row["template_id"])
+    name = f"{instance_id}_{(start or datetime.now()).date()}.csv"
+    return StreamingResponse(rows(instance_id, template, start, end, device_id), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.get("/{instance_id}/report")
+def shift_report(instance_id: str, day: Optional[str] = Query(default=None, alias="date"),
+                 user: dict = Depends(get_current_user)) -> dict:
+    from datetime import date as date_cls
+    from ..services.reports import shift_report as build
+    row = _owned(instance_id, user)
+    try:
+        when = date_cls.fromisoformat(day) if day else datetime.now().date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    report = build(instance_id, load_template(row["template_id"]), when)
+    report["instance"] = {"instance_id": instance_id, "name": row["name"], "plant": row.get("plant_key"),
+                          "asset_id": row.get("asset_id"), "template": row.get("template_name")}
+    return report
+
+
+@router.get("/{instance_id}/history")
+def change_history(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Audit trail: calibration, limits, mapping, activation (who / when / before / after)."""
+    _owned(instance_id, user)
+    rows = fetch_all(
+        "SELECT a.action, a.old_value, a.new_value, a.created_at, u.username FROM core.audit_logs a "
+        "LEFT JOIN core.users u ON u.id = a.user_id WHERE a.entity_type = 'instance' AND a.entity_id = %s "
+        "ORDER BY a.created_at DESC LIMIT 100", (instance_id,))
+    return {"history": [{**r, "created_at": r["created_at"].isoformat(),
+                         "old_value": _json(r["old_value"], None), "new_value": _json(r["new_value"], None)} for r in rows]}
+
+
+# ------------------------------------------------------------------ clone a line
+class CloneRequest(BaseModel):
+    name: str
+    asset_id: Optional[str] = None
+    port: Optional[str] = None
+
+
+@router.post("/{instance_id}/clone")
+def clone_instance(instance_id: str, body: CloneRequest, user: dict = Depends(get_current_user)) -> dict:
+    """Copy a working line to another: new source (same model + connection type), same mapping,
+    rules, limits and layout. Calibration is NOT copied — every sensor is recalibrated."""
+    import secrets as _secrets
+    from .devices import _next_device_id
+    from ..services.mappings import active_mapping, save_mapping
+    company_id = require_company(user)
+    row = _owned(instance_id, user)
+    src = load_device(row["device_id"])
+    if not src:
+        raise HTTPException(status_code=400, detail="Source instance has no device")
+    new_device = _next_device_id()
+    params = _json(src.get("connection_parameters"), {})
+    if body.port is not None:
+        params["port"] = body.port or None
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "INSERT INTO core.devices (device_id, company_id, plant_key, asset_id, profile_id, model_key, gateway_id, "
+            "device_address, ingest_key, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')",
+            (new_device, company_id, src.get("plant_key"), body.asset_id, src["profile_id"], src["model_key"],
+             src.get("gateway_id"), src.get("device_address"), _secrets.token_urlsafe(24)))
+        cur.execute(
+            "INSERT INTO core.device_connections (device_id, interface, baud_rate, address, poll_interval_ms, "
+            "connection_parameters, secrets) SELECT %s, interface, baud_rate, address, poll_interval_ms, %s, secrets "
+            "FROM core.device_connections WHERE device_id = %s",
+            (new_device, json.dumps(params), src["device_id"]))
+    new_id = _next_instance_id(row["template_id"])
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "INSERT INTO core.template_instances (instance_id, template_id, company_id, plant_key, asset_id, device_id, "
+            "name, status, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s)",
+            (new_id, row["template_id"], company_id, row.get("plant_key"), body.asset_id, new_device, body.name, user["id"]))
+        cur.execute("INSERT INTO core.data_mappings (instance_id, source_device_id, source_field, target_field) "
+                    "VALUES (%s, %s, 'displacement.value_mm', 'displacement.value_mm')", (new_id, new_device))
+        cur.execute(
+            "INSERT INTO core.template_config (instance_id, config_key, value) SELECT %s, config_key, value "
+            "FROM core.template_config WHERE instance_id = %s AND config_key NOT LIKE 'calibration.%%'",
+            (new_id, instance_id))
+        cur.execute("INSERT INTO core.alert_rules (instance_id, rule_type, params, enabled) "
+                    "SELECT %s, rule_type, params, enabled FROM core.alert_rules WHERE instance_id = %s", (new_id, instance_id))
+        cur.execute("INSERT INTO core.instance_dashboards (instance_id, layout, updated_by) "
+                    "SELECT %s, layout, %s FROM core.instance_dashboards WHERE instance_id = %s", (new_id, user["id"], instance_id))
+    template = load_template(row["template_id"])
+    defaults = {f["key"]: f["default"] for f in template.get("inputs") or []
+                if f["key"].startswith("calibration.") and f.get("default") is not None}
+    if defaults:
+        set_config(new_id, defaults)
+    mapping = active_mapping(instance_id, row["device_id"])
+    if mapping:
+        save_mapping(new_id, new_device, mapping["definition"], "clone", user["id"])
+    audit.log(user, "instance.clone", "instance", new_id, None, {"from": instance_id, "device": new_device})
+    return serialize_instance(get_instance(new_id, company_id))

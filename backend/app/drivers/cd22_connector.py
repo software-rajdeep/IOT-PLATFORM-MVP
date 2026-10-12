@@ -3,9 +3,13 @@
 The ONLY code in the platform that understands the OPTEX CD22 RS-485 protocol.
 Everything above it sees plain raw numbers; everything below it is bytes.
 
-Request / response frame (Optex ASCII command set):
+Request / response frame (Optex binary command set):
     request : [STX, CMD, ADDR_H, ADDR_L, ETX, BCC]   BCC = CMD ^ ADDR_H ^ ADDR_L
-    response: [STX, CMD, DATA_H, DATA_L, ETX, BCC]
+    response: [STX, ACK(0x06), DATA_H, DATA_L, ETX, BCC]   (NAK 0x15 on error)
+
+Transports: a local serial port ("COM3", "/dev/ttyUSB0") or a serial-to-Ethernet
+converter given as "host:port" (our field installs use TCP 8234). The CD22 is
+single-client: one reader per sensor at a time (see _PORT_LOCKS).
 The measurement register (CMD 0x43) returns a signed 16-bit count. It is NOT
 scaled here — scaling is BLOCK 3 (normalization) via the device model.
 
@@ -22,6 +26,8 @@ from __future__ import annotations
 
 import math
 import random
+import socket
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -36,6 +42,17 @@ CMD_OUTPUT_STATUS = 0x44
 CMD_ADDR_H = 0xB0
 CMD_ADDR_L = 0x01
 BAUD_DEFAULT = 38400
+ACK = 0x06
+FRAME_LEN = 6
+
+# One lock per physical port/endpoint: the CD22 interleaves bytes if two readers talk to it.
+_PORT_LOCKS: dict[str, threading.Lock] = {}
+_PORT_LOCKS_GUARD = threading.Lock()
+
+
+def _port_lock(key: str) -> threading.Lock:
+    with _PORT_LOCKS_GUARD:
+        return _PORT_LOCKS.setdefault(key, threading.Lock())
 
 
 def _bcc(*values: int) -> int:
@@ -67,7 +84,11 @@ class CD22RS485Connector(DeviceDriver):
 
     @staticmethod
     def _parse_value(response: bytes) -> Optional[int]:
-        if not response or len(response) < 4:
+        if not response or len(response) != FRAME_LEN:
+            return None
+        if response[0] != STX or response[1] != ACK or response[4] != ETX:
+            return None
+        if _bcc(response[1], response[2], response[3]) != response[5]:
             return None
         raw = (response[2] << 8) | response[3]
         if raw > 32767:
@@ -78,15 +99,22 @@ class CD22RS485Connector(DeviceDriver):
     def connect(self) -> None:
         if self.simulate:
             return
-        try:
-            import serial  # pyserial, optional
-        except ImportError as exc:  # pragma: no cover
-            raise DriverError(
-                "pyserial is required for a real RS-485 connection; "
-                "set connection simulate=true to run without hardware."
-            ) from exc
+        serial = None
+        if not self._is_tcp:
+            try:
+                import serial  # pyserial, optional
+            except ImportError as exc:  # pragma: no cover
+                raise DriverError(
+                    "pyserial is required for a real RS-485 connection; "
+                    "set connection simulate=true to run without hardware."
+                ) from exc
         if not self.port:
             raise DriverError("No serial port configured for the CD22 connector.")
+        if self._is_tcp:
+            host, port = str(self.port).rsplit(":", 1)
+            self._serial = socket.create_connection((host, int(port)), timeout=self.timeout)
+            self._serial.settimeout(self.timeout)
+            return
         self._serial = serial.Serial(
             port=self.port, baudrate=self.baud_rate, bytesize=8,
             parity="N", stopbits=1, timeout=self.timeout,
@@ -99,6 +127,29 @@ class CD22RS485Connector(DeviceDriver):
             finally:
                 self._serial = None
 
+    @property
+    def _is_tcp(self) -> bool:
+        port = str(self.port or "")
+        return ":" in port and port.rsplit(":", 1)[1].isdigit() and not port.upper().startswith("COM")
+
+    def _read_exact(self, n: int) -> bytes:
+        deadline = time.monotonic() + self.timeout
+        buf = b""
+        while len(buf) < n and time.monotonic() < deadline:
+            if self._is_tcp:
+                try:
+                    chunk = self._serial.recv(n - len(buf))
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+            else:
+                chunk = self._serial.read(n - len(buf))
+                if not chunk:
+                    break
+            buf += chunk
+        return buf
+
     # alias used by the base context manager
     open = connect
     close = disconnect
@@ -107,11 +158,19 @@ class CD22RS485Connector(DeviceDriver):
     def _transact(self, command: int) -> Optional[int]:
         if self.simulate:
             return self._simulate_raw()
-        if self._serial is None:
-            self.connect()
-        self._serial.reset_input_buffer()
-        self._serial.write(self._build_frame(command))
-        return self._parse_value(self._serial.read(8))
+        with _port_lock(str(self.port)):
+            try:
+                if self._serial is None:
+                    self.connect()
+                if self._is_tcp:
+                    self._serial.sendall(self._build_frame(command))
+                else:
+                    self._serial.reset_input_buffer()
+                    self._serial.write(self._build_frame(command))
+                return self._parse_value(self._read_exact(FRAME_LEN))
+            except (OSError, socket.timeout):
+                self.disconnect()
+                return None
 
     def readMeasurement(self) -> dict:  # noqa: N802 (protocol name)
         raw = self._transact(CMD_MEASURE)

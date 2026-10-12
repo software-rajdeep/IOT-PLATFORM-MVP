@@ -13,7 +13,11 @@ from ..deps import get_current_user, require_company
 from ..drivers import get_driver_class
 from ..drivers.database_api import DatabaseApiConnector
 from ..services.calibration import current_displacement
-from ..services.devices import connector_config, connector_driver_key, list_devices, load_device, serialize_device
+from ..config import settings
+from ..db import fetch_all
+from ..services.devices import (
+    _json, connector_config, connector_driver_key, list_devices, load_device, serialize_device, split_secrets,
+)
 from ..services.normalization import decode_displacement
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
@@ -54,7 +58,7 @@ class DatabaseApiIn(BaseModel):
 
 
 class ConnectionIn(BaseModel):
-    interface: str = "RS485"  # RS485 | database_api
+    interface: str = "RS485"  # RS485 | database_api | http_push
     baud_rate: Optional[int] = None
     address: Optional[int] = None
     poll_interval_ms: Optional[int] = None
@@ -101,9 +105,12 @@ def create_device(body: CreateDeviceRequest, user: dict = Depends(get_current_us
     device_id = _next_device_id()
     ingest_key = secrets.token_urlsafe(24)
     conn = body.connection
-    params = {"simulate": conn.simulate, "port": conn.port}
+    if conn.interface not in ("RS485", "database_api", "http_push"):
+        raise HTTPException(status_code=400, detail="Unknown interface")
+    params = {"simulate": conn.simulate if conn.interface != "http_push" else False, "port": conn.port}
+    secret_values: dict = {}
     if conn.database is not None:
-        params["database"] = _as_dict(conn.database)
+        params["database"], secret_values = split_secrets(_as_dict(conn.database))
     with get_cursor(commit=True) as cur:
         cur.execute(
             """
@@ -118,12 +125,12 @@ def create_device(body: CreateDeviceRequest, user: dict = Depends(get_current_us
         cur.execute(
             """
             INSERT INTO core.device_connections
-                (device_id, interface, baud_rate, address, poll_interval_ms, connection_parameters)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (device_id, interface, baud_rate, address, poll_interval_ms, connection_parameters, secrets)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
             (device_id, conn.interface, conn.baud_rate, conn.address,
-             conn.poll_interval_ms if conn.poll_interval_ms is not None else 100,
-             json.dumps(params)),
+             conn.poll_interval_ms if conn.poll_interval_ms is not None else (1000 if conn.interface != "RS485" else 500),
+             json.dumps(params), json.dumps(secret_values)),
         )
     return serialize_device(load_device(device_id))
 
@@ -146,7 +153,10 @@ def discover_source(body: DiscoverRequest, user: dict = Depends(get_current_user
     config = {"simulate": False, "database": _as_dict(conn.database)}
     try:
         driver = DatabaseApiConnector(config, {})
-        return driver.discover()
+        result = driver.discover()
+        if result.get("mode") == "internal" and driver.table:
+            result["sample"] = driver.read_payload()
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -217,8 +227,10 @@ def update_connection(device_id: str, body: ConnectionPatch, user: dict = Depend
         params["simulate"] = body.simulate
     if body.port is not None:
         params["port"] = body.port
+    stored_secrets = _json(device.get("secrets"), {})
     if body.database is not None:
-        params["database"] = _as_dict(body.database)
+        params["database"], new_secrets = split_secrets(_as_dict(body.database))
+        stored_secrets.update(new_secrets)  # blank secret fields keep the stored value
     execute(
         """
         UPDATE core.device_connections SET
@@ -227,10 +239,12 @@ def update_connection(device_id: str, body: ConnectionPatch, user: dict = Depend
             address = COALESCE(%s, address),
             poll_interval_ms = COALESCE(%s, poll_interval_ms),
             connection_parameters = %s,
+            secrets = %s,
             updated_at = now()
         WHERE device_id = %s
         """,
-        (body.interface, body.baud_rate, body.address, body.poll_interval_ms, json.dumps(params), device_id),
+        (body.interface, body.baud_rate, body.address, body.poll_interval_ms, json.dumps(params),
+         json.dumps(stored_secrets), device_id),
     )
     return serialize_device(load_device(device_id))
 
@@ -242,16 +256,29 @@ def test_device(device_id: str, user: dict = Depends(get_current_user)) -> dict:
     if not device or str(device["company_id"]) != company_id:
         raise HTTPException(status_code=404, detail="Device not found")
     driver_key = connector_driver_key(device)
+    if driver_key == "http_push":
+        last = fetch_one(
+            "SELECT ts, raw_payload FROM metrics.raw_device_messages WHERE device_id = %s ORDER BY ts DESC LIMIT 1",
+            (device_id,))
+        return {"connected": bool(last), "interface": "http_push",
+                "communication_status": "online" if last else "waiting",
+                "payload": _json(last["raw_payload"], {}) if last else None,
+                "last_message_at": last["ts"].isoformat() if last else None}
     connector_cls = get_driver_class(driver_key)
     if not connector_cls:
         raise HTTPException(status_code=400, detail=f"No connector for {driver_key}")
+    payload = None
     try:
         connector = connector_cls(connector_config(device), {"centre_distance": device.get("centre_distance")})
         connected = connector.checkConnection()
         reading = connector.readMeasurement() if connected else None
+        if connected and not connector.simulate and hasattr(connector, "read_payload"):
+            payload = connector.read_payload()
         connector.disconnect()
     except Exception as exc:
         return {"connected": False, "error": str(exc)}
+    if payload is not None:
+        return {"connected": True, "interface": driver_key, "communication_status": "online", "payload": payload}
     resolution = float(device["resolution"]) if device.get("resolution") is not None else 0.01
     raw = reading.get("measurement_raw") if reading else None
     return {
@@ -269,3 +296,30 @@ def device_displacement(device_id: str, user: dict = Depends(get_current_user)) 
     if not device or str(device["company_id"]) != company_id:
         raise HTTPException(status_code=404, detail="Device not found")
     return current_displacement(device_id) or {"displacement.value_mm": None, "ts": None}
+
+
+@router.get("/{device_id}/ingest-info")
+def ingest_info(device_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """HTTP push details for the customer's IT team (owner only)."""
+    company_id = require_company(user)
+    device = load_device(device_id)
+    if not device or str(device["company_id"]) != company_id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    url = f"{settings.public_base_url.rstrip('/')}/api/v1/ingest/{device_id}"
+    return {"url": url, "ingest_key": device["ingest_key"], "header": "X-Ingest-Key",
+            "example": f"curl -X POST {url} -H 'X-Ingest-Key: {device['ingest_key']}' "
+                       "-H 'Content-Type: application/json' -d '{\"value\": 1.502}'"}
+
+
+@router.get("/{device_id}/samples")
+def device_samples(device_id: str, limit: int = 20, user: dict = Depends(get_current_user)) -> dict:
+    """Recent raw payloads from a source (sample capture for mapping)."""
+    company_id = require_company(user)
+    device = load_device(device_id)
+    if not device or str(device["company_id"]) != company_id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    rows = fetch_all(
+        "SELECT message_id, ts, raw_payload FROM metrics.raw_device_messages WHERE device_id = %s "
+        "ORDER BY ts DESC LIMIT %s", (device_id, min(max(limit, 1), 100)))
+    return {"samples": [{"message_id": r["message_id"], "ts": r["ts"].isoformat(),
+                         "payload": _json(r["raw_payload"], {})} for r in rows]}

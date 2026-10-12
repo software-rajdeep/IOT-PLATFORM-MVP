@@ -25,4 +25,4 @@ def registered_keys() -> list[str]:
     return sorted(_REGISTRY.keys())
 
 
-from . import rubber_thickness  # noqa: E402,F401
+from . import generic_monitoring, rubber_thickness  # noqa: E402,F401

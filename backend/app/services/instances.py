@@ -12,10 +12,12 @@ SELECT
     t.device_id, t.name, t.status, t.created_at, t.updated_at,
     tpl.name AS template_name, tpl.version AS template_version,
     tpl.category, tpl.processor_key, tpl.inputs, tpl.dashboard,
-    d.model_key, d.status AS device_status, d.last_seen
+    tpl.requires, tpl.optional, tpl.outputs, tpl.field_roles, tpl.commissioning, tpl.purpose_key,
+    d.model_key, d.status AS device_status, d.last_seen, c.interface
 FROM core.template_instances t
 JOIN core.application_templates tpl ON tpl.template_id = t.template_id
 LEFT JOIN core.devices d ON d.device_id = t.device_id
+LEFT JOIN core.device_connections c ON c.device_id = t.device_id
 """
 
 
@@ -53,11 +55,16 @@ def set_config(instance_id: str, values: dict) -> None:
         cur.execute("UPDATE core.template_instances SET updated_at = now() WHERE instance_id = %s", (instance_id,))
 
 
-def _steps(config: dict, status: str) -> dict:
+def _steps(config: dict, status: str, row: Optional[dict] = None) -> dict:
+    roles = _json((row or {}).get("field_roles"), {}) or {
+        "target": "thickness.target_mm", "lower": "thickness.lower_limit_mm", "upper": "thickness.upper_limit_mm"}
+    commissioning = _json((row or {}).get("commissioning"), {})
+    needs_cal = commissioning.get("calibration") == "two_point"
+    limit_keys = [roles[k] for k in ("lower", "upper") if roles.get(k)]
     return {
         "connection": True,
-        "calibrated": config.get("calibration.scale") not in (None, "") and config.get("calibration.offset") not in (None, ""),
-        "limits": all(config.get(k) not in (None, "") for k in ("thickness.target_mm", "thickness.lower_limit_mm", "thickness.upper_limit_mm")),
+        "calibrated": (not needs_cal) or config.get("calibration.calibrated_at") not in (None, ""),
+        "limits": bool(limit_keys) and all(config.get(k) not in (None, "") for k in limit_keys),
         "active": status == "active",
     }
 
@@ -73,15 +80,23 @@ def serialize_instance(row: dict, config: Optional[dict] = None) -> dict:
         "device_id": row.get("device_id"),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "config": config,
-        "steps": _steps(config, row["status"]),
+        "steps": _steps(config, row["status"], row),
+        "interface": row.get("interface"),
+        "model_key": row.get("model_key"),
         "template": {
             "template_id": row.get("template_id"),
             "name": row.get("template_name"),
             "version": row.get("template_version"),
             "category": row.get("category"),
             "processor_key": row.get("processor_key"),
+            "purpose_key": row.get("purpose_key"),
             "inputs": _json(row.get("inputs"), []),
             "dashboard": _json(row.get("dashboard"), {}),
+            "requires": _json(row.get("requires"), []),
+            "optional": _json(row.get("optional"), []),
+            "outputs": _json(row.get("outputs"), []),
+            "field_roles": _json(row.get("field_roles"), {}),
+            "commissioning": _json(row.get("commissioning"), {}),
         },
     }
 
@@ -103,12 +118,12 @@ def list_instances(company_id: str) -> list[dict]:
 def instances_for_device(device_id: str) -> list[dict]:
     return fetch_all(
         """
-        SELECT t.instance_id, t.company_id, tpl.processor_key
+        SELECT t.instance_id, t.company_id, t.template_id, t.status, tpl.processor_key
         FROM core.template_instances t
         JOIN core.application_templates tpl ON tpl.template_id = t.template_id
         WHERE t.device_id = %s
         UNION
-        SELECT t.instance_id, t.company_id, tpl.processor_key
+        SELECT t.instance_id, t.company_id, t.template_id, t.status, tpl.processor_key
         FROM core.data_mappings m
         JOIN core.template_instances t ON t.instance_id = m.instance_id
         JOIN core.application_templates tpl ON tpl.template_id = t.template_id

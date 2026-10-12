@@ -1,20 +1,28 @@
-"""BLOCK 6 — dashboard data assembly (current, target, trend, stats, quality, health).
+"""BLOCK 6 — dashboard data assembly, generic for every template.
 
-The widget LAYOUT comes from the template's dashboard metadata; this function
-only supplies the values for the widgets.
+Values are read from metrics.measurements.fields using the template's field roles
+(primary / deviation / status / group / x_speed ...), so no widget or query is
+specific to thickness. The widget LAYOUT is per instance (core.instance_dashboards),
+defaulting to the template's dashboard metadata.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
 from ..db import fetch_all, fetch_one
+from . import alerts
 from .devices import load_device, serialize_device
 from .instances import _json, get_instance, instance_device_ids, load_config
+from .templates import load_template
 
 
 def _num(value):
-    return float(value) if value is not None else None
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 # Run-mode sections the customer can show/hide (config key ui.<name>, "0" = off).
@@ -31,13 +39,46 @@ def _ui(config: dict) -> dict:
     return ui
 
 
-def _secs_since(iso_ts) -> Optional[float]:
-    if not iso_ts:
+def _secs_since(ts) -> Optional[float]:
+    if not ts or isinstance(ts, str):
         return None
-    if isinstance(iso_ts, str):
-        return None
-    aware = iso_ts if iso_ts.tzinfo else iso_ts.replace(tzinfo=timezone.utc)
+    aware = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
     return round((datetime.now(timezone.utc) - aware).total_seconds(), 2)
+
+
+# Which ui.show_* toggle hides which widget (the earlier run-mode settings keep working).
+_UI_TOGGLE = {
+    "current_value": "show_current", "target_deviation": "show_target", "statistics": "show_statistics",
+    "pass_fail": "show_quality", "device_health": "show_health", "trend_band": "show_trend",
+    "history_table": "show_history", "calibration_status": "show_calibration", "limits_editor": "show_limits",
+}
+
+
+def get_layout(instance_id: str, template: dict, config: Optional[dict] = None) -> dict:
+    row = fetch_one("SELECT layout FROM core.instance_dashboards WHERE instance_id = %s", (instance_id,))
+    if row:
+        return _json(row["layout"], {"widgets": []})
+    layout = json.loads(json.dumps(template.get("dashboard") or {"widgets": []}))
+    ui = _ui(config or {})
+    layout["widgets"] = [w for w in layout.get("widgets", []) if ui.get(_UI_TOGGLE.get(w.get("type"), ""), True)]
+    for i, w in enumerate(layout["widgets"]):
+        w.setdefault("id", f"w{i + 1}")
+    return layout
+
+
+def _health(device: dict) -> dict:
+    age = _secs_since(device.get("last_seen"))
+    return {
+        "device_id": device["device_id"],
+        "model": device.get("model_name"),
+        "status": device.get("status"),
+        "interface": device.get("interface"),
+        "last_seen": device["last_seen"].isoformat() if device.get("last_seen") else None,
+        "seconds_since": age,
+        "communication": "ONLINE" if (age is not None and age <= 10) else "OFFLINE",
+        "gateway_id": device.get("gateway_id"),
+        "last_error": device.get("last_error"),
+    }
 
 
 def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: int = 500,
@@ -45,124 +86,135 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
     instance = get_instance(instance_id, company_id)
     if not instance:
         return None
+    template = load_template(instance["template_id"])
+    roles = template.get("field_roles") or {}
     config = load_config(instance_id)
 
-    device_ids = instance_device_ids(instance_id)
+    device_ids = [d for d in instance_device_ids(instance_id) if d]
     if device_id not in device_ids:
         device_id = instance.get("device_id")
-    device_ids = [did for did in device_ids if did]
+
+    f_primary = roles.get("primary")
+    f_dev = roles.get("deviation")
+    f_status = roles.get("status") or "quality.status"
+    f_group = roles.get("group")
+    f_speed = roles.get("x_speed")
 
     latest = fetch_one(
-        "SELECT ts, displacement_value_mm, thickness_mm, deviation_mm, quality_status "
-        "FROM metrics.measurements WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT 1",
-        (instance_id, device_id),
-    )
+        "SELECT ts, fields FROM metrics.measurements WHERE instance_id = %s AND device_id = %s "
+        "ORDER BY ts DESC LIMIT 1", (instance_id, device_id))
+    latest_fields = _json(latest["fields"], {}) if latest else {}
+
     stats = fetch_one(
         """
         SELECT count(*) AS total,
-               count(*) FILTER (WHERE quality_status = 'PASS') AS pass_count,
-               count(*) FILTER (WHERE quality_status = 'FAIL') AS fail_count,
-               min(thickness_mm) AS minimum, max(thickness_mm) AS maximum,
-               avg(thickness_mm) AS average, stddev_samp(thickness_mm) AS std_dev
-        FROM (
-            SELECT thickness_mm, quality_status FROM metrics.measurements
-            WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT %s
-        ) s
+               count(*) FILTER (WHERE fields->>%(st)s = 'PASS') AS pass_count,
+               count(*) FILTER (WHERE fields->>%(st)s = 'FAIL') AS fail_count,
+               min((fields->>%(p)s)::float) AS minimum, max((fields->>%(p)s)::float) AS maximum,
+               avg((fields->>%(p)s)::float) AS average, stddev_samp((fields->>%(p)s)::float) AS std_dev
+        FROM (SELECT fields FROM metrics.measurements
+              WHERE instance_id = %(i)s AND device_id = %(d)s AND fields IS NOT NULL
+              ORDER BY ts DESC LIMIT %(w)s) s
         """,
-        (instance_id, device_id, window),
-    )
-    trend_rows = fetch_all(
-        "SELECT ts, thickness_mm, deviation_mm, quality_status FROM metrics.measurements "
-        "WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT %s",
-        (instance_id, device_id, 200),
-    )
-    trend_rows.reverse()
+        {"st": f_status, "p": f_primary, "i": instance_id, "d": device_id, "w": window},
+    ) or {}
 
-    total = int(stats["total"]) if stats and stats["total"] is not None else 0
-    pass_count = int(stats["pass_count"]) if stats and stats["pass_count"] is not None else 0
-    fail_count = int(stats["fail_count"]) if stats and stats["fail_count"] is not None else 0
+    series_rows = fetch_all(
+        "SELECT ts, fields FROM metrics.measurements WHERE instance_id = %s AND device_id = %s AND fields IS NOT NULL "
+        "ORDER BY ts DESC LIMIT 200", (instance_id, device_id))
+    series_rows.reverse()
+    series = []
+    for r in series_rows:
+        f = _json(r["fields"], {})
+        series.append({
+            "ts": r["ts"].isoformat(),
+            "value": _num(f.get(f_primary)),
+            "deviation": _num(f.get(f_dev)) if f_dev else None,
+            "status": f.get(f_status),
+            "group": f.get(f_group) if f_group else None,
+            "speed": _num(f.get(f_speed)) if f_speed else None,
+            "input": _num(f.get(roles.get("input"))) if roles.get("input") else None,
+        })
 
-    def _summarize(did: str) -> Optional[dict]:
+    groups = []
+    if f_group:
+        groups = fetch_all(
+            """
+            SELECT fields->>%(g)s AS grp, count(*) AS n, avg((fields->>%(p)s)::float) AS average,
+                   stddev_samp((fields->>%(p)s)::float) AS std_dev,
+                   count(*) FILTER (WHERE fields->>%(st)s = 'PASS') AS pass_count
+            FROM (SELECT fields FROM metrics.measurements WHERE instance_id = %(i)s AND device_id = %(d)s
+                  AND fields IS NOT NULL ORDER BY ts DESC LIMIT 2000) s
+            WHERE fields ? %(g)s GROUP BY 1 ORDER BY 1
+            """,
+            {"g": f_group, "p": f_primary, "st": f_status, "i": instance_id, "d": device_id},
+        )
+        groups = [{"group": g["grp"], "count": int(g["n"]), "average": _num(g["average"]),
+                   "std_dev": _num(g["std_dev"]),
+                   "pass_percentage": round(int(g["pass_count"]) / int(g["n"]) * 100, 2) if g["n"] else None}
+                  for g in groups]
+
+    target, lower, upper = (_num(config.get(roles.get(k))) if roles.get(k) else None for k in ("target", "lower", "upper"))
+    total = int(stats.get("total") or 0)
+    pass_count, fail_count = int(stats.get("pass_count") or 0), int(stats.get("fail_count") or 0)
+    mean, sigma = _num(stats.get("average")), _num(stats.get("std_dev"))
+    capability = {"cp": None, "cpk": None}
+    if sigma and sigma > 0 and lower is not None and upper is not None and mean is not None:
+        capability = {"cp": round((upper - lower) / (6 * sigma), 3),
+                      "cpk": round(min(upper - mean, mean - lower) / (3 * sigma), 3)}
+
+    devices = []
+    for did in device_ids:
         dev = load_device(did)
-        if not dev:
-            return None
-        summary = serialize_device(dev)
-        last_seen = dev.get("last_seen")
-        age = _secs_since(last_seen)
-        summary["online"] = age is not None and age <= 5
-        summary["device_id"] = did
-        return summary
-
-    devices = [s for s in (_summarize(did) for did in device_ids) if s]
-
-    device = load_device(device_id)
-    health = None
-    if device:
-        last_seen = device.get("last_seen")
-        age = _secs_since(last_seen)
-        health = {
-            "device_id": device["device_id"],
-            "model": device.get("model_name"),
-            "status": device.get("status"),
-            "last_seen": last_seen.isoformat() if last_seen else None,
-            "seconds_since": age,
-            "communication": "ONLINE" if (age is not None and age <= 5) else "OFFLINE",
-            "gateway_id": device.get("gateway_id"),
-        }
+        if dev:
+            summary = serialize_device(dev)
+            h = _health(dev)
+            devices.append({"device_id": did, "name": summary["name"], "ip": summary.get("ip"),
+                            "model": (summary.get("model") or {}).get("model_name"),
+                            "online": h["communication"] == "ONLINE", "selected": did == device_id})
+    device = load_device(device_id) if device_id else None
 
     return {
         "instance_id": instance_id,
         "name": instance["name"],
         "status": instance["status"],
+        "template": {"template_id": template["template_id"], "name": template["name"],
+                     "processor_key": template.get("processor_key"), "commissioning": template.get("commissioning")},
+        "roles": roles,
+        "label": roles.get("label") or "Value",
+        "unit": roles.get("unit") or "",
         "active_device": device_id,
-        "devices": [
-            {
-                "device_id": d["device_id"],
-                "name": d.get("name") or d["device_id"],
-                "ip": d.get("ip"),
-                "model": d.get("model", {}).get("model_name"),
-                "online": d.get("online", False),
-                "selected": d["device_id"] == device_id,
-            }
-            for d in devices
-        ],
-        "layout": _json(instance.get("dashboard"), {}),
+        "devices": devices,
+        "layout": get_layout(instance_id, template, config),
         "ui": _ui(config),
         "config": {
-            "thickness.target_mm": _num(config.get("thickness.target_mm")),
-            "thickness.lower_limit_mm": _num(config.get("thickness.lower_limit_mm")),
-            "thickness.upper_limit_mm": _num(config.get("thickness.upper_limit_mm")),
+            "target": target, "lower": lower, "upper": upper,
+            "keys": {k: roles.get(k) for k in ("target", "lower", "upper")},
             "calibration.scale": _num(config.get("calibration.scale")),
             "calibration.offset": _num(config.get("calibration.offset")),
             "calibration.calibrated_at": config.get("calibration.calibrated_at"),
+            "calibration.calibrated_by": config.get("calibration.calibrated_by"),
+            "filter.window": _num(config.get("filter.window")),
         },
         "current": {
-            "ts": latest["ts"].isoformat() if latest and latest.get("ts") else None,
-            "displacement.value_mm": _num(latest["displacement_value_mm"]) if latest else None,
-            "thickness.actual_mm": _num(latest["thickness_mm"]) if latest else None,
-            "thickness.deviation_mm": _num(latest["deviation_mm"]) if latest else None,
-            "quality.status": latest["quality_status"] if latest else None,
+            "ts": latest["ts"].isoformat() if latest else None,
+            "value": _num(latest_fields.get(f_primary)),
+            "deviation": _num(latest_fields.get(f_dev)) if f_dev else None,
+            "status": latest_fields.get(f_status),
+            "input": _num(latest_fields.get(roles.get("input"))) if roles.get("input") else None,
+            "group": latest_fields.get(f_group) if f_group else None,
+            "speed": _num(latest_fields.get(f_speed)) if f_speed else None,
+            "fields": latest_fields,
         },
-        "statistics": {
-            "minimum": _num(stats["minimum"]) if stats else None,
-            "maximum": _num(stats["maximum"]) if stats else None,
-            "average": _num(stats["average"]) if stats else None,
-            "std_dev": _num(stats["std_dev"]) if stats else None,
-            "samples": total,
-        },
-        "quality": {
-            "pass_count": pass_count,
-            "fail_count": fail_count,
-            "pass_percentage": round(pass_count / total * 100, 2) if total else None,
-        },
-        "trend": [
-            {
-                "ts": r["ts"].isoformat() if r.get("ts") else None,
-                "thickness.actual_mm": _num(r["thickness_mm"]),
-                "thickness.deviation_mm": _num(r["deviation_mm"]),
-                "quality.status": r["quality_status"],
-            }
-            for r in trend_rows
-        ],
-        "device_health": health,
+        "statistics": {"minimum": _num(stats.get("minimum")), "maximum": _num(stats.get("maximum")),
+                       "average": mean, "std_dev": sigma, "samples": total},
+        "quality": {"pass_count": pass_count, "fail_count": fail_count,
+                    "pass_percentage": round(pass_count / (pass_count + fail_count) * 100, 2)
+                    if (pass_count + fail_count) else None},
+        "capability": capability,
+        "groups": groups,
+        "trend": series,
+        "device_health": _health(device) if device else None,
+        "alerts": alerts.list_events(instance_id, 10),
     }
+

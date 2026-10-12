@@ -14,20 +14,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
-from .routers import auth, catalog, demo_customer, devices, gateway, instances, meta
+from .routers import auth, catalog, demo_customer, devices, gateway, instance_setup, instances, meta
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.enable_simulator:
-        from . import simulator
+    if settings.auth_secret == "dev-secret-change-me":
+        print("[security] AUTH_SECRET is the development default; set a real secret before any deployment.")
+    from . import simulator
+    from .routers import demo_customer as demo
 
+    if settings.enable_poller:
         simulator.start()
+    if settings.enable_demo_customer:
+        demo.start_feeder()
     yield
-    if settings.enable_simulator:
-        from . import simulator
-
-        simulator.stop()
+    simulator.stop()
+    demo.stop_feeder()
 
 
 app = FastAPI(
@@ -53,8 +56,9 @@ async def no_cache_static(request, call_next):
         response.headers["Cache-Control"] = "no-store"
     return response
 
-for module in (meta, auth, catalog, devices, instances, gateway, demo_customer):
+for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer):
     app.include_router(module.router)
+app.include_router(gateway.push_router)
 
 # Serve the frontend last so /api/v1 routes take precedence.
 if FRONTEND_DIR.exists():
