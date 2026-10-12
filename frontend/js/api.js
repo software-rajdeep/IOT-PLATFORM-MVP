@@ -48,7 +48,9 @@ export const api = {
   devices: () => request("/devices"),
   device: (id) => request(`/devices/${id}`),
   createDevice: (data) => request("/devices", { method: "POST", body: data }),
+  updateDevice: (id, data) => request(`/devices/${id}`, { method: "PATCH", body: data }),
   testDevice: (id) => request(`/devices/${id}/test`, { method: "POST" }),
+  discoverSource: (data) => request("/devices/discover-source", { method: "POST", body: data }),
   deviceDisplacement: (id) => request(`/devices/${id}/displacement`),
 
   // template instances (BLOCK 5)
@@ -59,8 +61,12 @@ export const api = {
   calibrate: (id, data) => request(`/instances/${id}/calibrate`, { method: "POST", body: data }),
   verifyCalibration: (id, data) => request(`/instances/${id}/calibration/verify`, { method: "POST", body: data }),
   activate: (id) => request(`/instances/${id}/activate`, { method: "POST" }),
+  instanceDevices: (id) => request(`/instances/${id}/devices`),
+  addInstanceDevice: (id, deviceId) =>
+    request(`/instances/${id}/devices`, { method: "POST", body: { device_id: deviceId } }),
 
   // dashboard (BLOCK 6)
-  dashboard: (id) => request(`/instances/${id}/dashboard`),
+  dashboard: (id, deviceId) =>
+    request(`/instances/${id}/dashboard` + (deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "")),
   measurements: (id, limit = 100) => request(`/instances/${id}/measurements?limit=${limit}`),
 };

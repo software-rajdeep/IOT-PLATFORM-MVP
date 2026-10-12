@@ -102,9 +102,42 @@ def list_instances(company_id: str) -> list[dict]:
 
 def instances_for_device(device_id: str) -> list[dict]:
     return fetch_all(
-        "SELECT t.instance_id, t.company_id, tpl.processor_key "
-        "FROM core.template_instances t "
-        "JOIN core.application_templates tpl ON tpl.template_id = t.template_id "
-        "WHERE t.device_id = %s",
-        (device_id,),
+        """
+        SELECT t.instance_id, t.company_id, tpl.processor_key
+        FROM core.template_instances t
+        JOIN core.application_templates tpl ON tpl.template_id = t.template_id
+        WHERE t.device_id = %s
+        UNION
+        SELECT t.instance_id, t.company_id, tpl.processor_key
+        FROM core.data_mappings m
+        JOIN core.template_instances t ON t.instance_id = m.instance_id
+        JOIN core.application_templates tpl ON tpl.template_id = t.template_id
+        WHERE m.source_device_id = %s
+        """,
+        (device_id, device_id),
     )
+
+
+def instance_device_ids(instance_id: str) -> list[str]:
+    """Every source device for an instance: the primary device plus mapped devices."""
+    rows = fetch_all(
+        """
+        SELECT device_id FROM (
+            SELECT t.device_id AS device_id
+            FROM core.template_instances t
+            WHERE t.instance_id = %s AND t.device_id IS NOT NULL
+            UNION
+            SELECT m.source_device_id AS device_id
+            FROM core.data_mappings m
+            WHERE m.instance_id = %s AND m.source_device_id IS NOT NULL
+        ) s
+        """,
+        (instance_id, instance_id),
+    )
+    seen, result = set(), []
+    for row in rows:
+        did = row["device_id"]
+        if did not in seen:
+            seen.add(did)
+            result.append(did)
+    return result

@@ -22,4 +22,4 @@ def registered_keys() -> list[str]:
 
 
 # Self-register connectors on package import.
-from . import cd22_connector  # noqa: E402,F401
+from . import cd22_connector, database_api  # noqa: E402,F401

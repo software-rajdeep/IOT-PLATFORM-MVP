@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
-from .routers import auth, catalog, devices, gateway, instances, meta
+from .routers import auth, catalog, demo_customer, devices, gateway, instances, meta
 
 
 @asynccontextmanager
@@ -44,7 +44,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (meta, auth, catalog, devices, instances, gateway):
+
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    """Never cache the dependency-free frontend so UI changes appear instantly."""
+    response = await call_next(request)
+    if request.url.path in ("/", "/index.html") or request.url.path.startswith(("/js/", "/css/")):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+for module in (meta, auth, catalog, devices, instances, gateway, demo_customer):
     app.include_router(module.router)
 
 # Serve the frontend last so /api/v1 routes take precedence.

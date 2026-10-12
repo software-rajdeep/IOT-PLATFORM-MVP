@@ -35,7 +35,7 @@ export async function renderApplications(view, ctx, setCleanup) {
     host.querySelectorAll(".card").forEach((card) => {
       card.addEventListener("click", () => {
         const inst = instances.find((x) => x.instance_id === card.dataset.id);
-        ctx.navigate(inst && inst.steps && inst.steps.active ? `#/app/${card.dataset.id}` : `#/calibrate/${card.dataset.id}`);
+        ctx.navigate(`#/app/${card.dataset.id}`);
       });
     });
   } catch (err) {

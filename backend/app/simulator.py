@@ -15,7 +15,7 @@ from typing import Optional
 
 from .db import fetch_all
 from .drivers import get_driver_class
-from .services.devices import connector_config, load_device
+from .services.devices import connector_config, connector_driver_key, load_device
 from .services.instances import instances_for_device, load_config
 from .services.processing import process_measurement
 
@@ -76,7 +76,7 @@ def _loop(interval: float = 0.5) -> None:
                 device = load_device(device_id)
                 if not device:
                     continue
-                connector_cls = get_driver_class(device["connector_type"])
+                connector_cls = get_driver_class(connector_driver_key(device))
                 if not connector_cls:
                     continue
                 config = connector_config(device)

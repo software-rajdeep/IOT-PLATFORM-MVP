@@ -7,8 +7,6 @@ import { renderPurposes } from "./views/purpose.js";
 import { renderTemplates } from "./views/template.js";
 import { renderApplications } from "./views/apps.js";
 import { renderConnection } from "./views/connection.js";
-import { renderCalibration } from "./views/calibration.js";
-import { renderLimits } from "./views/limits.js";
 import { renderDashboard } from "./views/dashboard.js";
 
 const app = document.getElementById("app");
@@ -101,9 +99,12 @@ async function route() {
     else if (parts[0] === "templates") await renderTemplates(view, ctx, setCleanup);
     else if (parts[0] === "connection") await renderConnection(view, ctx, setCleanup);
     else if (parts[0] === "apps") await renderApplications(view, ctx, setCleanup);
-    else if (parts[0] === "calibrate" && parts[1]) await renderCalibration(view, ctx, setCleanup, parts[1]);
-    else if (parts[0] === "limits" && parts[1]) await renderLimits(view, ctx, setCleanup, parts[1]);
     else if (parts[0] === "app" && parts[1]) await renderDashboard(view, ctx, setCleanup, parts[1]);
+    else if ((parts[0] === "calibrate" || parts[0] === "limits") && parts[1]) {
+      view.innerHTML = "";
+      await renderDashboard(view, ctx, setCleanup, parts[1]);
+      location.hash = `#/app/${parts[1]}`;
+    }
     else await renderDevices(view, ctx, setCleanup);
   } catch (err) {
     view.innerHTML = `<div class="page narrow"><div class="error-box">${esc(err.message)}</div></div>`;

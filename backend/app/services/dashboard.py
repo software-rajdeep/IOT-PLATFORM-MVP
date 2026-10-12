@@ -9,12 +9,26 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..db import fetch_all, fetch_one
-from .devices import load_device
-from .instances import _json, get_instance, load_config
+from .devices import load_device, serialize_device
+from .instances import _json, get_instance, instance_device_ids, load_config
 
 
 def _num(value):
     return float(value) if value is not None else None
+
+
+# Run-mode sections the customer can show/hide (config key ui.<name>, "0" = off).
+UI_KEYS = (
+    "show_device_switcher", "show_live_status", "show_calibration", "show_limits",
+    "show_current", "show_target", "show_statistics", "show_quality", "show_health",
+    "show_trend", "show_history",
+)
+
+
+def _ui(config: dict) -> dict:
+    ui = {key: str(config.get(f"ui.{key}")) != "0" for key in UI_KEYS}
+    ui["graph_type"] = str(config.get("ui.graph_type") or "line").strip() or "line"
+    return ui
 
 
 def _secs_since(iso_ts) -> Optional[float]:
@@ -26,16 +40,22 @@ def _secs_since(iso_ts) -> Optional[float]:
     return round((datetime.now(timezone.utc) - aware).total_seconds(), 2)
 
 
-def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: int = 500) -> Optional[dict]:
+def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: int = 500,
+                    device_id: Optional[str] = None) -> Optional[dict]:
     instance = get_instance(instance_id, company_id)
     if not instance:
         return None
     config = load_config(instance_id)
 
+    device_ids = instance_device_ids(instance_id)
+    if device_id not in device_ids:
+        device_id = instance.get("device_id")
+    device_ids = [did for did in device_ids if did]
+
     latest = fetch_one(
         "SELECT ts, displacement_value_mm, thickness_mm, deviation_mm, quality_status "
-        "FROM metrics.measurements WHERE instance_id = %s ORDER BY ts DESC LIMIT 1",
-        (instance_id,),
+        "FROM metrics.measurements WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT 1",
+        (instance_id, device_id),
     )
     stats = fetch_one(
         """
@@ -46,15 +66,15 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
                avg(thickness_mm) AS average, stddev_samp(thickness_mm) AS std_dev
         FROM (
             SELECT thickness_mm, quality_status FROM metrics.measurements
-            WHERE instance_id = %s ORDER BY ts DESC LIMIT %s
+            WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT %s
         ) s
         """,
-        (instance_id, window),
+        (instance_id, device_id, window),
     )
     trend_rows = fetch_all(
         "SELECT ts, thickness_mm, deviation_mm, quality_status FROM metrics.measurements "
-        "WHERE instance_id = %s ORDER BY ts DESC LIMIT %s",
-        (instance_id, 200),
+        "WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT %s",
+        (instance_id, device_id, 200),
     )
     trend_rows.reverse()
 
@@ -62,7 +82,20 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
     pass_count = int(stats["pass_count"]) if stats and stats["pass_count"] is not None else 0
     fail_count = int(stats["fail_count"]) if stats and stats["fail_count"] is not None else 0
 
-    device = load_device(instance["device_id"]) if instance.get("device_id") else None
+    def _summarize(did: str) -> Optional[dict]:
+        dev = load_device(did)
+        if not dev:
+            return None
+        summary = serialize_device(dev)
+        last_seen = dev.get("last_seen")
+        age = _secs_since(last_seen)
+        summary["online"] = age is not None and age <= 5
+        summary["device_id"] = did
+        return summary
+
+    devices = [s for s in (_summarize(did) for did in device_ids) if s]
+
+    device = load_device(device_id)
     health = None
     if device:
         last_seen = device.get("last_seen")
@@ -81,13 +114,27 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
         "instance_id": instance_id,
         "name": instance["name"],
         "status": instance["status"],
+        "active_device": device_id,
+        "devices": [
+            {
+                "device_id": d["device_id"],
+                "name": d.get("name") or d["device_id"],
+                "ip": d.get("ip"),
+                "model": d.get("model", {}).get("model_name"),
+                "online": d.get("online", False),
+                "selected": d["device_id"] == device_id,
+            }
+            for d in devices
+        ],
         "layout": _json(instance.get("dashboard"), {}),
+        "ui": _ui(config),
         "config": {
             "thickness.target_mm": _num(config.get("thickness.target_mm")),
             "thickness.lower_limit_mm": _num(config.get("thickness.lower_limit_mm")),
             "thickness.upper_limit_mm": _num(config.get("thickness.upper_limit_mm")),
             "calibration.scale": _num(config.get("calibration.scale")),
             "calibration.offset": _num(config.get("calibration.offset")),
+            "calibration.calibrated_at": config.get("calibration.calibrated_at"),
         },
         "current": {
             "ts": latest["ts"].isoformat() if latest and latest.get("ts") else None,

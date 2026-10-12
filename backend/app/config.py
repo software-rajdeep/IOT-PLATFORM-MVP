@@ -40,6 +40,10 @@ class Settings:
     database_url: str = os.environ.get(
         "DATABASE_URL", "postgresql://postgres:linux@localhost:5432/ucap_platform"
     )
+    customer_demo_db: str = os.environ.get(
+        "CUSTOMER_DEMO_DATABASE_URL",
+        "postgresql://postgres:linux@localhost:5432/ucap_customer_corp",
+    )
     auth_secret: str = os.environ.get("AUTH_SECRET", "dev-secret-change-me")
     token_ttl_seconds: int = int(os.environ.get("TOKEN_TTL_SECONDS", "604800"))
     app_host: str = os.environ.get("APP_HOST", "127.0.0.1")

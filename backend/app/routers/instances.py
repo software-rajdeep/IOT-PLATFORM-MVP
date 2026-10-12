@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,8 +12,8 @@ from ..db import execute, fetch_all, fetch_one, get_cursor
 from ..deps import get_current_user, require_company
 from ..services.calibration import compute_linear, current_displacement
 from ..services.dashboard import build_dashboard
-from ..services.instances import get_instance, list_instances, load_config, serialize_instance, set_config
-from ..services.devices import load_device
+from ..services.devices import DEVICE_SELECT, load_device, serialize_device
+from ..services.instances import get_instance, instance_device_ids, list_instances, load_config, serialize_instance, set_config
 
 router = APIRouter(prefix="/api/v1/instances", tags=["instances"])
 
@@ -65,6 +66,71 @@ def _owned(instance_id: str, user: dict) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Instance not found")
     return row
+
+
+class AddInstanceDeviceRequest(BaseModel):
+    device_id: str
+
+
+def _seconds_since(last_seen) -> Optional[float]:
+    if not last_seen:
+        return None
+    aware = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=timezone.utc)
+    return round((datetime.now(timezone.utc) - aware).total_seconds(), 2)
+
+
+def _device_summary(device: dict) -> dict:
+    summary = serialize_device(device)
+    age = _seconds_since(device.get("last_seen"))
+    summary["online"] = age is not None and age <= 5
+    return summary
+
+
+@router.get("/{instance_id}/devices")
+def list_instance_devices(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    instance = _owned(instance_id, user)
+    company_id = require_company(user)
+    mapped_ids = instance_device_ids(instance_id)
+    mapped = []
+    for did in mapped_ids:
+        dev = load_device(did)
+        if dev:
+            mapped.append(_device_summary(dev))
+
+    available = []
+    model_key = instance.get("model_key")
+    if model_key:
+        rows = fetch_all(
+            DEVICE_SELECT + " WHERE d.company_id = %s AND d.status = 'active' AND d.model_key = %s "
+            "ORDER BY d.created_at",
+            (company_id, model_key),
+        )
+        for r in rows:
+            if r["device_id"] in mapped_ids:
+                continue
+            available.append(_device_summary(r))
+    return {"instance_id": instance_id, "mapped": mapped, "available": available}
+
+
+@router.post("/{instance_id}/devices")
+def add_instance_device(instance_id: str, body: AddInstanceDeviceRequest,
+                        user: dict = Depends(get_current_user)) -> dict:
+    instance = _owned(instance_id, user)
+    company_id = require_company(user)
+    dev = load_device(body.device_id)
+    if not dev or str(dev["company_id"]) != company_id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    model_key = instance.get("model_key")
+    if model_key and dev.get("model_key") != model_key:
+        raise HTTPException(status_code=400, detail="Device model must match this application's device model")
+    if body.device_id in instance_device_ids(instance_id):
+        return list_instance_devices(instance_id, user)
+    execute(
+        "INSERT INTO core.data_mappings (instance_id, source_device_id, source_field, target_field) "
+        "VALUES (%s, %s, 'displacement.value_mm', 'displacement.value_mm')",
+        (instance_id, body.device_id),
+    )
+    return list_instance_devices(instance_id, user)
 
 
 @router.post("")
@@ -149,9 +215,12 @@ def calibrate(instance_id: str, body: CalibrateRequest, user: dict = Depends(get
     if d1 is None or d2 is None:
         raise HTTPException(status_code=400, detail="Reference displacements are required (or the device must have live data).")
 
-    scale, offset = compute_linear(
-        body.reference_1_thickness, d1, body.reference_2_thickness, d2,
-    )
+    try:
+        scale, offset = compute_linear(
+            body.reference_1_thickness, d1, body.reference_2_thickness, d2,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     set_config(instance_id, {
         "calibration.scale": scale,
         "calibration.offset": offset,
@@ -205,9 +274,10 @@ def activate(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/{instance_id}/dashboard")
-def dashboard(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+def dashboard(instance_id: str, device_id: Optional[str] = Query(default=None),
+              user: dict = Depends(get_current_user)) -> dict:
     company_id = require_company(user)
-    data = build_dashboard(instance_id, company_id)
+    data = build_dashboard(instance_id, company_id, device_id=device_id)
     if not data:
         raise HTTPException(status_code=404, detail="Instance not found")
     return data

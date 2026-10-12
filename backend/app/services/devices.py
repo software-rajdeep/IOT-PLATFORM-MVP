@@ -57,9 +57,33 @@ def connector_config(device: dict) -> dict:
     return config
 
 
+def connector_driver_key(device: dict) -> str:
+    """Resolve which driver to use for a device based on its connection interface.
+
+    RS-485 / default -> the device profile's connector_type (e.g. cd22_rs485).
+    database_api      -> the customer-database connector.
+    """
+    interface = str(device.get("interface") or "").strip().lower()
+    if interface == "database_api":
+        return "database_api"
+    return device.get("connector_type") or "cd22_rs485"
+
+
 def serialize_device(row: dict) -> dict:
+    params = _json(row.get("connection_parameters"), {})
+    display_name = (row.get("asset_id") or "").strip() or row["device_id"]
+    db = params.get("database") or {}
+    host = db.get("host")
+    if params.get("port"):
+        ip = str(params.get("port"))
+    elif host:
+        ip = f"{host}:{db.get('port')}" if db.get("port") else str(host)
+    else:
+        ip = None
     return {
         "device_id": row["device_id"],
+        "name": display_name,
+        "ip": ip,
         "status": row["status"],
         "plant": row.get("plant_key"),
         "asset_id": row.get("asset_id"),
@@ -88,6 +112,6 @@ def serialize_device(row: dict) -> dict:
             "baud_rate": row.get("baud_rate"),
             "address": row.get("conn_address"),
             "poll_interval_ms": row.get("poll_interval_ms"),
-            "parameters": _json(row.get("connection_parameters"), {}),
+            "parameters": params,
         },
     }
