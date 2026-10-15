@@ -19,7 +19,8 @@ Two source modes:
 1. INTERNAL — a database we can reach directly (our DB, or credentials provided).
    Discovery lists tables/columns; the mapping picks columns.
 2. CUSTOMER — the customer's own server, reachable only via API (key + secret).
-   Discovery lists JSON keys; the mapping picks dot-notation paths.
+   If the API exposes a `/tables` listing (our generic customer API does), discovery
+   returns every table/column; otherwise it lists the JSON keys of the latest response.
 
 Every connector returns the same customer-agnostic raw value dict:
 
@@ -36,6 +37,7 @@ import json
 import math
 import random
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -193,12 +195,27 @@ class DatabaseApiConnector(DeviceDriver):
         data = dict(zip(columns, row))
         return data
 
-    def _fetch_json(self) -> Any:
-        if not (self.api_url and self.api_key and self.api_secret):
+    def _api_base(self) -> str:
+        parts = urllib.parse.urlsplit(self.api_url or "")
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def _with_table(self, url: str) -> str:
+        """Append ?table=<configured table> when the customer API is table-addressable."""
+        if not self.table:
+            return url
+        parts = urllib.parse.urlsplit(url)
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        query.setdefault("table", self.table)
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
+        )
+
+    def _request_json(self, url: str) -> Any:
+        if not (url and self.api_key and self.api_secret):
             raise DriverError("Customer API connection requires api_url, api_key and api_secret.")
         from ..services.source_guard import SourceBlocked, check_url
         try:
-            check_url(self.api_url)
+            check_url(url)
         except SourceBlocked as exc:
             raise DriverError(str(exc)) from exc
         headers = {
@@ -207,7 +224,7 @@ class DatabaseApiConnector(DeviceDriver):
             "X-Api-Secret": self.api_secret,
             "Authorization": f"Bearer {self.api_secret}",
         }
-        req = urllib.request.Request(self.api_url, headers=headers, method="GET")
+        req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
                 body = response.read(MAX_RESPONSE_BYTES + 1)
@@ -219,6 +236,19 @@ class DatabaseApiConnector(DeviceDriver):
             return json.loads(body.decode("utf-8"))
         except ValueError as exc:
             raise DriverError("Customer API did not return JSON") from exc
+
+    def _fetch_json(self) -> Any:
+        return self._request_json(self._with_table(self.api_url))
+
+    def _fetch_tables(self) -> Optional[list]:
+        """Ask the API for a table listing (GET <base>/tables). None when unsupported."""
+        try:
+            data = self._request_json(f"{self._api_base()}/tables")
+        except Exception:
+            return None
+        if isinstance(data, dict) and isinstance(data.get("tables"), list):
+            return [t for t in data["tables"] if isinstance(t, dict) and t.get("columns")]
+        return None
 
     def _read_customer(self) -> dict:
         payload = self._fetch_json()
@@ -275,6 +305,9 @@ class DatabaseApiConnector(DeviceDriver):
         }
 
     def _discover_customer(self) -> dict:
+        tables = self._fetch_tables()
+        if tables:
+            return {"mode": "customer", "tables": tables, "source": "metadata"}
         payload = self._fetch_json()
         return {"mode": "customer", "sample": payload, "fields": _flatten_keys(payload)}
 

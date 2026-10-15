@@ -4,6 +4,7 @@ thickness-monitoring/
 # secrets & local env
 .env
 backend/.env
+secrets.local.md
 *.log
 
 # python

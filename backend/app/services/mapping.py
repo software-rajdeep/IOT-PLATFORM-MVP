@@ -297,11 +297,11 @@ def preset_definition(profile: dict, model: dict, template_contract: list[dict])
 
 
 _SYNONYMS = {
-    "displacement": ["displacement", "distance", "disp", "laser", "value", "reading", "measurement", "raw", "val"],
+    "displacement": ["displacement", "distance", "disp", "laser", "value", "reading", "measurement", "raw", "val", "sensor"],
     "thickness": ["thickness", "thk", "gauge", "value"],
     "speed": ["speed", "line_speed", "mpm", "velocity", "rate"],
     "text": ["product", "prod", "recipe", "sku", "item", "code", "batch", "order"],
-    "number": ["value", "reading", "val", "measurement", "raw"],
+    "number": ["value", "reading", "val", "measurement", "raw", "sensor"],
 }
 
 

@@ -141,7 +141,11 @@ def save(instance_id: str, body: SaveMappingRequest, user: dict = Depends(get_cu
     if missing:
         raise HTTPException(status_code=400, detail=f"Map the required fields first: {', '.join(missing)}")
     known = {c["key"] for c in contract(template)}
-    unknown = [f.get("target") for f in body.definition.get("fields", []) if f.get("target") not in known]
+    # Extra sensors are stored as "<field_key>.<n>" (e.g. displacement.value_mm.2), so
+    # several sensor columns can feed the same application input.
+    unknown = [f.get("target") for f in body.definition.get("fields", [])
+               if f.get("target") and f.get("target") not in known
+               and not any(str(f.get("target")).startswith(k + ".") for k in known)]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown template fields: {', '.join(map(str, unknown))}")
     old = active_mapping(instance_id, row["device_id"])

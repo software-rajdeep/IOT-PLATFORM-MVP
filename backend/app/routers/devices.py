@@ -19,7 +19,9 @@ from ..services.devices import (
     _json, connector_config, connector_driver_key, list_devices, load_device, resolve_plant, serialize_device,
     split_secrets,
 )
+from ..services.discovery import scope_discovery
 from ..services.normalization import decode_displacement
+from ..services.templates import contract, load_template
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 
@@ -138,6 +140,7 @@ def create_device(body: CreateDeviceRequest, user: dict = Depends(get_current_us
 
 class DiscoverRequest(BaseModel):
     connection: ConnectionIn
+    template_id: Optional[str] = None  # scope the listing to this application
 
 
 @router.post("/discover-source")
@@ -145,18 +148,27 @@ def discover_source(body: DiscoverRequest, user: dict = Depends(get_current_user
     """Introspect an unknown customer source so target fields can be mapped.
 
     Returns the tables/columns (internal mode) or the JSON keys/sample
-    (customer mode) that are available to map onto measurement_raw etc.
+    (customer mode) that are available to map onto the application's standard
+    fields. When `template_id` is given, the listing is scoped to that
+    application: only the tables/columns/fields that can feed its inputs are
+    returned (see services/discovery.py).
     """
     require_company(user)
     conn = body.connection
     if conn.interface != "database_api" or conn.database is None:
         raise HTTPException(status_code=400, detail="Discovery requires a database_api connection.")
+    template = load_template(body.template_id) if body.template_id else None
+    field_contract = contract(template) if template else None
     config = {"simulate": False, "database": _as_dict(conn.database)}
     try:
         driver = DatabaseApiConnector(config, {})
         result = driver.discover()
         if result.get("mode") == "internal" and driver.table:
             result["sample"] = driver.read_payload()
+        result = scope_discovery(result, field_contract)
+        if template:
+            result["application"] = {"template_id": template["template_id"], "name": template["name"]}
+            result["contract"] = field_contract
         return result
     except HTTPException:
         raise

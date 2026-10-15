@@ -19,7 +19,7 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     el.innerHTML = `<div class="grid-stack-item-content widget" data-type="${esc(w.type)}">
       <div class="w-head"><span class="w-title"></span>${editable ? `<button class="w-x" title="Remove">×</button>` : ""}</div>
       <div class="w-body"><div class="empty">loading…</div></div></div>`;
-    items.set(id, { id, type: w.type, title: w.title, el, drawn: false });
+    items.set(id, { id, type: w.type, title: w.title, el, drawn: false, state: {} });
     if (editable) el.querySelector(".w-x").addEventListener("click", () => remove(id));
     return el;
   }
@@ -54,7 +54,7 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
       const title = it.title || (DEFAULT_TITLES[it.type] ? DEFAULT_TITLES[it.type](data) : it.type);
       it.el.querySelector(".w-title").textContent = title;
       if (STATIC_WIDGETS.has(it.type) && it.drawn) continue;
-      it.el.querySelector(".w-body").innerHTML = renderWidget(it.type, data);
+      it.el.querySelector(".w-body").innerHTML = renderWidget(it.type, data, it.state);
       it.drawn = true;
     }
   }
@@ -77,6 +77,16 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     if (act && handlers[act.dataset.act]) handlers[act.dataset.act](act, e);
     const ack = e.target.closest("[data-ack]");
     if (ack && handlers.ack) handlers.ack(Number(ack.dataset.ack));
+  });
+
+  container.addEventListener("change", (e) => {
+    const sel = e.target.closest("[data-sensor-select]");
+    if (!sel) return;
+    const itemEl = sel.closest(".grid-stack-item");
+    const it = itemEl && items.get(itemEl.getAttribute("gs-id"));
+    if (!it) return;
+    it.state = { ...it.state, sensor: sel.value };
+    if (last) update(last);
   });
 
   return { grid, add, remove, update, redraw, getLayout, types: () => [...items.values()].map((i) => i.type),

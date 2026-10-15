@@ -174,6 +174,21 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
                             "online": h["communication"] == "ONLINE", "selected": did == device_id})
     device = load_device(device_id) if device_id else None
 
+    # Extra sensors: several source columns can feed one input, stored as "<input>.<n>".
+    input_key = roles.get("input") or next(
+        (c["key"] for c in (template.get("requires") or []) if c.get("required")), None)
+    sensors = []
+    if input_key:
+        keys = sorted((k for k in latest_fields if k == input_key or k.startswith(input_key + ".")),
+                      key=lambda k: (k != input_key, k))
+        per_key = {k: [] for k in keys}
+        for r in series_rows:
+            f = _json(r["fields"], {})
+            for k in keys:
+                per_key[k].append({"ts": r["ts"].isoformat(), "value": _num(f.get(k))})
+        sensors = [{"key": k, "label": f"Sensor {i + 1}", "value": _num(latest_fields.get(k)),
+                    "series": per_key[k]} for i, k in enumerate(keys)]
+
     return {
         "instance_id": instance_id,
         "name": instance["name"],
@@ -213,6 +228,7 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
                     if (pass_count + fail_count) else None},
         "capability": capability,
         "groups": groups,
+        "sensors": sensors,
         "trend": series,
         "device_health": _health(device) if device else None,
         "alerts": alerts.list_events(instance_id, 10),

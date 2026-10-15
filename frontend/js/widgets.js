@@ -20,6 +20,8 @@ export const DEFAULT_TITLES = {
   limits_editor: () => "Limits",
   alerts_list: () => "Alerts",
   history_table: () => "Reading history",
+  sensor_list: () => "Sensor readings",
+  raw_readings: () => "Raw readings",
 };
 
 // Widgets that hold user input are drawn once, not on every live refresh.
@@ -112,7 +114,7 @@ function donut(pct) {
     <text x="40" y="45" text-anchor="middle" font-size="15" fill="var(--text)" font-family="var(--mono)">${pct == null ? "—" : Math.round(pct) + "%"}</text></svg>`;
 }
 
-export function renderWidget(type, d) {
+export function renderWidget(type, d, state = {}) {
   const c = d.current || {}, s = d.statistics || {}, q = d.quality || {}, cfg = d.config || {};
   const u = esc(d.unit || "");
   switch (type) {
@@ -192,6 +194,24 @@ export function renderWidget(type, d) {
           <td class="td-mono td-r">${r.deviation == null ? "—" : fmt(r.deviation)}</td>
           <td><span class="badge ${cls(r.status)}">${esc(r.status || "—")}</span></td>${r.group ? `<td class="td-mono">${esc(r.group)}</td>` : ""}</tr>`).join("")}
         </tbody></table>` : `<div class="empty">waiting for readings…</div>`;
+    }
+    case "sensor_list": {
+      const list = d.sensors || [];
+      return list.length ? `<table class="wtable"><thead><tr><th>Sensor</th><th class="td-r">Reading ${u}</th></tr></thead><tbody>
+        ${list.map((s) => `<tr><td>${esc(s.label || s.key)}</td><td class="td-r td-mono">${fmt(s.value)}</td></tr>`).join("")}
+        </tbody></table>` : `<div class="empty">one sensor — add more in Setup › Map</div>`;
+    }
+    case "raw_readings": {
+      const list = d.sensors || [];
+      if (!list.length) return `<div class="empty">one sensor — add more in Setup › Map</div>`;
+      const selectedKey = list.some((s) => s.key === state.sensor) ? state.sensor : list[0].key;
+      const sel = list.find((s) => s.key === selectedKey) || list[0];
+      const opts = list.map((s) => `<option value="${esc(s.key)}"${s.key === selectedKey ? " selected" : ""}>${esc(s.label || s.key)}</option>`).join("");
+      const rows = [...(sel.series || [])].reverse().slice(0, 60);
+      return `<div class="raw-head"><label class="raw-select">Sensor <select data-sensor-select>${opts}</select></label></div>
+        ${rows.length ? `<table class="wtable"><thead><tr><th>Time</th><th class="td-r">Raw ${u}</th></tr></thead><tbody>
+        ${rows.map((r) => `<tr><td class="td-mono td-dim">${esc(shortTime(r.ts))}</td><td class="td-mono td-r">${fmt(r.value)}</td></tr>`).join("")}
+        </tbody></table>` : `<div class="empty">waiting for raw readings…</div>`}`;
     }
     default:
       return `<div class="empty">unknown widget ${esc(type)}</div>`;

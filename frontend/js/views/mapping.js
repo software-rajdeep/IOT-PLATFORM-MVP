@@ -19,11 +19,15 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
   const unitDim = Object.fromEntries(units.map((u) => [u.unit_key, u.dimension]));
   const contract = info.contract || [];
   const roles = instance.template.field_roles || {};
+  const baseField = contract.find((c) => c.required && c.kind !== "text")
+    || contract.find((c) => c.required) || contract[0] || {};
+  const baseKey = baseField.key;
   let samples = [];
   let paths = [];
   let sampleIdx = 0;
   let rows = rowsFrom(info.current ? info.current.definition : null);
   let tsRow = tsFrom(info.current ? info.current.definition : null);
+  let extras = extrasFrom(info.current ? info.current.definition : null);
   const presetMode = info.current && info.current.origin === "preset";
   let editing = !presetMode;
 
@@ -44,21 +48,46 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
     const t = (def && def.timestamp) || {};
     return { path: t.path || "", format: t.format || "auto", tz: t.tz || "Asia/Kolkata" };
   }
+  function extraRow(def, target) {
+    const f = ((def && def.fields) || []).find((x) => x.target === target) || {};
+    const t = f.transforms || [];
+    const unit = t.find((x) => x.type === "unit");
+    const scale = t.find((x) => x.type === "scale");
+    const offset = t.find((x) => x.type === "offset");
+    return { path: f.path || "", from: unit ? unit.from : (baseField.unit || ""),
+             scale: scale ? scale.factor : 1, offset: offset ? offset.value : 0 };
+  }
+  function extrasFrom(def) {
+    if (!baseKey) return [];
+    const out = [];
+    for (let n = 2; ; n += 1) {
+      const target = `${baseKey}.${n}`;
+      const exists = ((def && def.fields) || []).some((f) => f.target === target);
+      if (!exists) break;
+      out.push(extraRow(def, target));
+    }
+    return out;
+  }
+
+  function transformsFor(r, field) {
+    const transforms = [];
+    if (field.kind === "text") { transforms.push({ type: "cast", to: "text" }); return transforms; }
+    transforms.push({ type: "cast", to: "decimal" });
+    if (r.from && field.unit && r.from !== field.unit) transforms.push({ type: "unit", from: r.from, to: field.unit });
+    if (Number(r.scale) !== 1 && r.scale !== "" && r.scale != null) transforms.push({ type: "scale", factor: Number(r.scale) });
+    if (Number(r.offset)) transforms.push({ type: "offset", value: Number(r.offset) });
+    return transforms;
+  }
 
   function definition() {
     const fields = [];
     rows.forEach((r, i) => {
       if (!r.path) return;
-      const c = contract[i];
-      const transforms = [];
-      if (c.kind === "text") transforms.push({ type: "cast", to: "text" });
-      else {
-        transforms.push({ type: "cast", to: "decimal" });
-        if (r.from && c.unit && r.from !== c.unit) transforms.push({ type: "unit", from: r.from, to: c.unit });
-        if (Number(r.scale) !== 1 && r.scale !== "" && r.scale != null) transforms.push({ type: "scale", factor: Number(r.scale) });
-        if (Number(r.offset)) transforms.push({ type: "offset", value: Number(r.offset) });
-      }
-      fields.push({ target: c.key, path: r.path, transforms });
+      fields.push({ target: contract[i].key, path: r.path, transforms: transformsFor(r, contract[i]) });
+    });
+    if (baseKey) extras.forEach((r, i) => {
+      if (!r.path) return;
+      fields.push({ target: `${baseKey}.${i + 2}`, path: r.path, transforms: transformsFor(r, baseField) });
     });
     const def = { fields };
     if (tsRow.path) def.timestamp = { ...tsRow };
@@ -146,6 +175,16 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
             </div>
             <div class="hint">No timestamp mapped = time the platform received the reading.</div>
           </div>
+          ${baseKey ? `
+          <div class="panel">
+            <h3>Additional sensors</h3>
+            <p class="hint">Map extra sensor columns to the same reading (e.g. sensor_a, sensor_b, sensor_c).
+              They are stored with every measurement and listed on the dashboard.</p>
+            <div class="table-wrap"><table class="map-table"><thead><tr>
+              <th>Sensor</th><th>Source path</th><th>Unit sent</th><th>Scale</th><th>Offset</th><th class="td-r">Result</th><th></th>
+            </tr></thead><tbody id="sensor-rows"></tbody></table></div>
+            <button class="btn secondary btn-sm" id="add-sensor" type="button">+ Add sensor</button>
+          </div>` : ""}
           <div class="panel">
             <h3>Preview through the whole pipeline</h3>
             <div id="preview"><div class="empty">Map the required fields to see the result.</div></div>
@@ -159,6 +198,7 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
         </div>
       </div></div>`;
     drawRows();
+    drawSensors();
     document.getElementById("cap").addEventListener("click", capture);
     document.getElementById("sample-pick").addEventListener("change", (e) => { sampleIdx = Number(e.target.value); drawSample(); preview(); });
     ["ts-path", "ts-format", "ts-tz"].forEach((id) => document.getElementById(id).addEventListener("change", () => {
@@ -169,6 +209,41 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
     document.getElementById("save").addEventListener("click", save);
     const sf = document.getElementById("show-fail");
     if (sf) sf.addEventListener("click", async (e) => { e.preventDefault(); showFailures(); });
+    const addSensor = document.getElementById("add-sensor");
+    if (addSensor) addSensor.addEventListener("click", () => {
+      extras.push({ path: "", from: baseField.unit || "", scale: 1, offset: 0 });
+      drawSensors();
+      preview();
+    });
+  }
+
+  function drawSensors() {
+    const body = document.getElementById("sensor-rows");
+    if (!body) return;
+    body.innerHTML = extras.map((r, i) => `<tr data-i="${i}">
+      <td>Sensor ${i + 2}</td>
+      <td><select class="x-path">${pathOptions(r.path, false)}</select></td>
+      <td><select class="x-unit">${unitOptions(baseField, r.from)}</select></td>
+      <td><input class="x-scale mini-input" type="number" step="any" value="${esc(r.scale)}" /></td>
+      <td><input class="x-offset mini-input" type="number" step="any" value="${esc(r.offset)}" /></td>
+      <td class="td-mono td-r x-result">—</td>
+      <td><button class="w-x x-del" type="button" title="Remove">×</button></td></tr>`).join("");
+    body.querySelectorAll("tr").forEach((tr) => {
+      const i = Number(tr.dataset.i);
+      tr.querySelector(".x-path").addEventListener("change", (e) => {
+        extras[i].path = e.target.value;
+        const p = paths.find((x) => x.path === e.target.value);
+        if (p && p.unit_hint && baseField.unit && unitDim[p.unit_hint] === unitDim[baseField.unit]) {
+          extras[i].from = p.unit_hint;
+          const u = tr.querySelector(".x-unit"); if (u) u.value = p.unit_hint;
+        }
+        preview();
+      });
+      tr.querySelector(".x-unit").addEventListener("change", (e) => { extras[i].from = e.target.value; preview(); });
+      tr.querySelector(".x-scale").addEventListener("input", (e) => { extras[i].scale = e.target.value; preview(); });
+      tr.querySelector(".x-offset").addEventListener("input", (e) => { extras[i].offset = e.target.value; preview(); });
+      tr.querySelector(".x-del").addEventListener("click", () => { extras.splice(i, 1); drawSensors(); preview(); });
+    });
   }
 
   function drawRows() {
@@ -263,6 +338,13 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
           const err = res.errors.find((e) => e.field === key);
           const cell = tr.querySelector(".m-result");
           cell.innerHTML = err ? `<span class="bad">${esc(err.code)}</span>` : v == null ? "—" : esc(typeof v === "number" ? fmt(v, 4) : v);
+        });
+        document.querySelectorAll("#sensor-rows tr").forEach((tr) => {
+          const key = `${baseKey}.${Number(tr.dataset.i) + 2}`;
+          const v = res.values[key];
+          const err = res.errors.find((e) => e.field === key);
+          const cell = tr.querySelector(".x-result");
+          if (cell) cell.innerHTML = err ? `<span class="bad">${esc(err.code)}</span>` : v == null ? "—" : esc(fmt(v, 4));
         });
         const out = res.outputs || {};
         const primary = out[roles.primary];

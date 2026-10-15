@@ -61,8 +61,17 @@ that session's scratchpad); the data was demo seed only. If ports are busy, chec
 
 ## Rules for this project
 
+- Terminology: when the user says **"kvm" / "kvm server"**, it means the KVM host that runs our databases
+  (customer DB + platform DB). Host, container, ports and credentials are documented only in the gitignored
+  `secrets.local.md` — read it there, never copy its details into git.
 - Follow `~/.claude/CLAUDE.md` (concise, no emojis, ask before destructive commands, no paid-API calls without asking).
 - Commit author for any `rajdeep-automation` repo: `rajdeep-automation <299466890+rajdeep-automation@users.noreply.github.com>`.
 - Never commit `.env` or plaintext passwords. Don't add the laptop password to this repo.
 - Respect the block separation in README: the connector knows only the protocol; tolerances/calibration live in
   template config, not code. New devices/purposes/templates/customers should be data, not code.
+- **Generalization principle (non-negotiable).** Nothing customer-specific is hard-coded anywhere — no database,
+  schema, table or column names in code. We never know the customer's data layout. The platform knows only what an
+  application/template *needs* (its canonical inputs, e.g. thickness needs a displacement in mm). Those needs are
+  discovered from the customer's source and **mapped** (data, not code) to the canonical fields; the mapping is the
+  connection between their columns and our fields/frontend. After mapping, the app knows the path to the readings.
+  Every new customer, source, schema or unit must work through configuration/mapping alone.

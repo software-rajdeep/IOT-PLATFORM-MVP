@@ -61,6 +61,12 @@ export async function renderConnection(view, ctx, setCleanup) {
               </div>
               <div class="field"><label>Poll every (ms)</label><input id="api-poll" type="number" value="1000" /></div>
               <button type="button" class="btn-ghost" id="demo-fill">Use the demo customer's line API</button>
+              <button class="btn secondary btn-sm" id="api-discover" type="button">Discover tables</button>
+              <div id="api-discover-result" class="hint" style="margin:8px 0"></div>
+              <div id="api-table-wrap" class="hidden">
+                <div class="field"><label>Table exposed by the API</label><select id="api-table"></select></div>
+                <div id="api-cols" style="margin-top:8px"></div>
+              </div>
             </div>
 
             <div id="src-db" class="src-fields hidden">
@@ -76,6 +82,7 @@ export async function renderConnection(view, ctx, setCleanup) {
               <div id="db-table-wrap" class="hidden">
                 <div class="field"><label>Table</label><select id="db-table"></select></div>
                 <div class="field"><label>Timestamp column (to read the newest row)</label><select id="db-order"></select></div>
+                <div id="db-cols" style="margin-top:8px"></div>
               </div>
               <div class="field"><label>Poll every (ms)</label><input id="db-poll" type="number" value="1000" /></div>
             </div>
@@ -100,6 +107,8 @@ export async function renderConnection(view, ctx, setCleanup) {
   }).catch(() => {});
   let device = null;
   let tables = [];
+  let apiTables = [];
+  let discoverResult = null;
   function invalidateSource() {
     device = null;
     testPanel.innerHTML = `<h3>Source test</h3><div class="empty">Create and test the updated source before continuing.</div>`;
@@ -140,11 +149,20 @@ export async function renderConnection(view, ctx, setCleanup) {
     const btn = event.currentTarget;
     btn.disabled = true; btn.textContent = "Discovering…";
     try {
-      const result = await api.discoverSource({ connection: { interface: "database_api", database: dbConnection() } });
-      tables = result.tables || [];
+      discoverResult = await api.discoverSource({
+        connection: { interface: "database_api", database: dbConnection() },
+        template_id: template.template_id,
+      });
+      tables = discoverResult.tables || [];
       fillSelect("db-table", tables.map((t) => t.table));
-      $("db-table-wrap").classList.remove("hidden");
-      $("discover-result").textContent = `${tables.length} tables found.`;
+      $("db-table-wrap").classList.toggle("hidden", !tables.length);
+      $("db-cols").innerHTML = "";
+      const app = discoverResult.application ? ` for ${esc(discoverResult.application.name)}` : "";
+      const hidden = discoverResult.hidden_tables ? ` · ${discoverResult.hidden_tables} unrelated hidden` : "";
+      $("discover-result").innerHTML = tables.length
+        ? `${tables.length} table(s) related to your application${app}${esc(hidden)}.`
+        : `${esc(discoverResult.note || "No tables found.")}`;
+      if (tables.length) { $("db-table").value = tables[0].table; $("db-table").dispatchEvent(new Event("change")); }
     } catch (err) {
       $("discover-result").textContent = err.message;
     } finally { btn.disabled = false; btn.textContent = "Discover tables"; }
@@ -153,8 +171,50 @@ export async function renderConnection(view, ctx, setCleanup) {
     const t = tables.find((x) => x.table === e.target.value);
     const cols = t ? t.columns : [];
     fillSelect("db-order", cols.map((c) => c.column));
-    const guess = cols.find((c) => /time|date|ts/i.test(c.column) && /time|date/i.test(c.type));
+    const guess = cols.find((c) => c.category === "datetime") || cols.find((c) => /time|date|ts/i.test(c.column));
     if (guess) $("db-order").value = guess.column;
+    $("db-cols").innerHTML = t ? `
+      <div class="hint">Columns related to this application — these are the ones you will map next:</div>
+      <div class="table-wrap"><table><thead><tr><th>Column</th><th>Type</th><th>Feeds</th></tr></thead><tbody>
+        ${cols.map((c) => `<tr><td class="td-mono">${esc(c.column)}</td><td class="td-dim">${esc(c.type)}</td>
+          <td>${(c.matches || []).map((m) => `<span class="badge muted">${esc(m)}</span>`).join(" ")
+            || `<span class="td-dim">${esc(c.category)}</span>`}</td></tr>`).join("")}
+      </tbody></table></div>` : "";
+  });
+
+  $("api-discover").addEventListener("click", async (event) => {
+    const btn = event.currentTarget;
+    if (!$("api-url").value.trim()) { toast("Enter the API URL"); return; }
+    btn.disabled = true; btn.textContent = "Discovering…";
+    try {
+      const res = await api.discoverSource({
+        connection: { interface: "database_api", simulate: false,
+          database: { mode: "customer", api_url: $("api-url").value.trim(),
+            api_key: $("api-key").value.trim(), api_secret: $("api-secret").value } },
+        template_id: template.template_id,
+      });
+      apiTables = res.tables || [];
+      fillSelect("api-table", apiTables.map((t) => t.table));
+      $("api-table-wrap").classList.toggle("hidden", !apiTables.length);
+      $("api-cols").innerHTML = "";
+      $("api-discover-result").innerHTML = apiTables.length
+        ? `${apiTables.length} table(s) related to this application.`
+        : `${esc(res.note || "This API exposes no table listing; its latest response is mapped directly.")}`;
+      if (apiTables.length) { $("api-table").value = apiTables[0].table; $("api-table").dispatchEvent(new Event("change")); }
+    } catch (err) {
+      $("api-discover-result").textContent = err.message;
+    } finally { btn.disabled = false; btn.textContent = "Discover tables"; }
+  });
+  $("api-table").addEventListener("change", (e) => {
+    const t = apiTables.find((x) => x.table === e.target.value);
+    const cols = t ? t.columns : [];
+    $("api-cols").innerHTML = t ? `
+      <div class="hint">Columns exposed by this table — these are the ones you will map next:</div>
+      <div class="table-wrap"><table><thead><tr><th>Column</th><th>Type</th><th>Feeds</th></tr></thead><tbody>
+        ${cols.map((c) => `<tr><td class="td-mono">${esc(c.column)}</td><td class="td-dim">${esc(c.type)}</td>
+          <td>${(c.matches || []).map((m) => `<span class="badge muted">${esc(m)}</span>`).join(" ")
+            || `<span class="td-dim">${esc(c.category || "")}</span>`}</td></tr>`).join("")}
+      </tbody></table></div>` : "";
   });
 
   function payloadFor() {
@@ -165,7 +225,7 @@ export async function renderConnection(view, ctx, setCleanup) {
     } else if (source === "api") {
       Object.assign(conn, { interface: "database_api", simulate: false, poll_interval_ms: parseInt($("api-poll").value, 10) || 1000,
         database: { mode: "customer", api_url: $("api-url").value.trim(), api_key: $("api-key").value.trim(),
-          api_secret: $("api-secret").value } });
+          api_secret: $("api-secret").value, table: $("api-table").value || null } });
     } else if (source === "db") {
       Object.assign(conn, { interface: "database_api", simulate: false, poll_interval_ms: parseInt($("db-poll").value, 10) || 1000,
         database: { ...dbConnection(), table: $("db-table").value || null, order_by: $("db-order").value || null } });
