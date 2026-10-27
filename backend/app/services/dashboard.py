@@ -19,6 +19,15 @@ from ..db import fetch_all, fetch_one
 from . import alerts
 from .devices import load_device, serialize_device
 from .instances import _json, get_instance, instance_device_ids, load_config
+from .limits import bounds
+from .opposite_calibration import (
+    ZERO_OFFSET_MM,
+    auto_gap_active,
+    gap_distance,
+    object_thickness,
+    tolerance,
+)
+from .sbs_calibration import parse_baselines, reference_enabled, reference_key, sensor_keys
 from .templates import load_template
 
 
@@ -72,6 +81,11 @@ def get_layout(instance_id: str, template: dict, config: Optional[dict] = None) 
 
 def _health(device: dict) -> dict:
     age = _secs_since(device.get("last_seen"))
+    # A replay source walks historical rows, so its next reading can be a few
+    # seconds apart while the source runtime works through other devices.
+    params = _json(device.get("connection_parameters"), {})
+    replay = bool(((params.get("database") or {}).get("replay") or {}).get("enabled"))
+    online_within = 60 if replay else 10
     return {
         "device_id": device["device_id"],
         "model": device.get("model_name"),
@@ -79,7 +93,8 @@ def _health(device: dict) -> dict:
         "interface": device.get("interface"),
         "last_seen": device["last_seen"].isoformat() if device.get("last_seen") else None,
         "seconds_since": age,
-        "communication": "ONLINE" if (age is not None and age <= 10) else "OFFLINE",
+        "communication": "ONLINE" if (age is not None and age <= online_within) else "OFFLINE",
+        "replay": replay,
         "gateway_id": device.get("gateway_id"),
         "last_error": device.get("last_error"),
     }
@@ -127,6 +142,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
         return None
     template = load_template(instance["template_id"])
     roles = template.get("field_roles") or {}
+    processor_key = template.get("processor_key") or ""
     config = load_config(instance_id)
 
     device_ids = [d for d in instance_device_ids(instance_id) if d]
@@ -217,26 +233,57 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
     input_key = roles.get("input") or next(
         (c["key"] for c in (template.get("requires") or []) if c.get("required")), None)
     sensors = []
+    ref_key = None
     if input_key:
-        keys = sorted(
-            (k for k in latest_fields
-             if k == input_key or k.startswith(input_key + ".") or k.startswith(input_key + "_")),
-            key=lambda k: (k != input_key, k),
-        )
+        keys = sensor_keys(latest_fields, input_key) or [input_key]
+        ref_key = reference_key(config, keys)
         per_key = {k: [] for k in keys}
         for r in series_rows:
             f = _json(r["fields"], {})
             for k in keys:
                 per_key[k].append({"ts": r["ts"].isoformat(), "value": _num(f.get(k))})
-        sensors = [{"key": k, "label": f"Sensor {i + 1}", "value": _num(latest_fields.get(k)),
-                    "series": per_key[k]} for i, k in enumerate(keys)]
+        sensors = []
+        for i, k in enumerate(keys):
+            suffix = k[len(input_key):] if k.startswith(input_key) else ""
+            thickness_key = f"thickness.sensor_mm{suffix}"
+            status_key = "quality.reference_status" if k == ref_key else f"quality.sensor_status{suffix}"
+            value = _num(latest_fields.get(k))
+            distance = None
+            if processor_key == "opposite_thickness" and value is not None:
+                distance = round(ZERO_OFFSET_MM + value, 6)
+            sensors.append({
+                "key": k,
+                "label": f"Sensor {i + 1}" + (" (reference)" if k == ref_key else ""),
+                "value": value,
+                "distance": distance,
+                "thickness": _num(latest_fields.get(thickness_key)),
+                "status": latest_fields.get(status_key),
+                "error": _num(latest_fields.get("reference.error_mm")) if k == ref_key else None,
+                "is_reference": k == ref_key,
+                "series": per_key[k],
+            })
+
+    limit_keys = {k: roles.get(k) for k in ("target", "lower", "upper")}
+    lower_key = roles.get("lower")
+    upper_key = roles.get("upper")
+    active_key = None
+    if lower_key or upper_key:
+        active_key = (lower_key or upper_key).split(".")[0] + ".limit_active"
+    if reference_enabled(config):
+        limit_keys.update({"reference_lower": "reference.lower_limit_mm",
+                           "reference_upper": "reference.upper_limit_mm"})
+    limit_keys["limit_active"] = active_key
+    _, _, limit_active = bounds(
+        config, active_key or "thickness.limit_active",
+        lower_key or "thickness.lower_limit_mm", upper_key or "thickness.upper_limit_mm")
 
     return {
         "instance_id": instance_id,
         "name": instance["name"],
         "status": instance["status"],
         "template": {"template_id": template["template_id"], "name": template["name"],
-                     "processor_key": template.get("processor_key"), "commissioning": template.get("commissioning")},
+                     "processor_key": processor_key, "commissioning": template.get("commissioning")},
+        "processor_key": processor_key,
         "roles": roles,
         "label": roles.get("label") or "Value",
         "unit": roles.get("unit") or "",
@@ -246,11 +293,25 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
         "ui": _ui(config),
         "config": {
             "target": target, "lower": lower, "upper": upper,
-            "keys": {k: roles.get(k) for k in ("target", "lower", "upper")},
+            "limit_active": limit_active,
+            "keys": limit_keys,
             "calibration.scale": _num(config.get("calibration.scale")),
             "calibration.offset": _num(config.get("calibration.offset")),
+            "calibration.mode": config.get("calibration.mode") or "auto",
+            "calibration.reference_thickness": _num(config.get("calibration.reference_thickness")),
+            "calibration.baselines": parse_baselines(config),
+            "calibration.gap_distance": gap_distance(config),
+            "calibration.object_thickness": object_thickness(config),
+            "calibration.tolerance_mm": tolerance(config),
+            "calibration.auto_gap_active": auto_gap_active(config),
             "calibration.calibrated_at": config.get("calibration.calibrated_at"),
             "calibration.calibrated_by": config.get("calibration.calibrated_by"),
+            "reference.enabled": reference_enabled(config),
+            "reference.sensor_key": ref_key,
+            "reference.limit_active": str(config.get("reference.limit_active") or "").lower()
+            in {"1", "true", "yes", "on"},
+            "reference.lower": _num(config.get("reference.lower_limit_mm")),
+            "reference.upper": _num(config.get("reference.upper_limit_mm")),
             "filter.window": _num(config.get("filter.window")),
         },
         "current": {
@@ -258,6 +319,8 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             "value": _num(latest_fields.get(f_primary)),
             "deviation": _num(latest_fields.get(f_dev)) if f_dev else None,
             "status": latest_fields.get(f_status),
+            "reference_error": _num(latest_fields.get("reference.error_mm")),
+            "reference_status": latest_fields.get("quality.reference_status"),
             "input": _num(latest_fields.get(roles.get("input"))) if roles.get("input") else None,
             "group": latest_fields.get(f_group) if f_group else None,
             "speed": _num(latest_fields.get(f_speed)) if f_speed else None,

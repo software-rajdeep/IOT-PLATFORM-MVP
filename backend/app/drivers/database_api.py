@@ -18,9 +18,13 @@ arbitrary customer database.
 Two source modes:
 1. INTERNAL — a database we can reach directly (our DB, or credentials provided).
    Discovery lists tables/columns; the mapping picks columns.
-2. CUSTOMER — the customer's own server, reachable only via API (key + secret).
-   If the API exposes a `/tables` listing (our generic customer API does), discovery
-   returns every table/column; otherwise it lists the JSON keys of the latest response.
+2. CUSTOMER — the customer's own server, reachable only via API (URL + API key;
+   an additional secret is optional). Discovery understands three shapes:
+   - a `/tables` listing (our generic customer API),
+   - a PostgREST/Neon Data API OpenAPI spec (`<api_url>/openapi.json`),
+   - otherwise the JSON keys of the latest response.
+   For a PostgREST endpoint, rows are read from `<api_url>/<table>` instead of a
+   `?table=` query parameter.
 
 Every connector returns the same customer-agnostic raw value dict:
 
@@ -33,11 +37,16 @@ Every connector returns the same customer-agnostic raw value dict:
 """
 from __future__ import annotations
 
+import base64
+import http.cookiejar
 import json
 import math
+import os
+import queue
 import random
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -49,6 +58,11 @@ from .registry import register
 
 DEFAULT_PORT = 5432
 MAX_RESPONSE_BYTES = 1_000_000
+# Several replay sources can poll the same database at once (one connection per poll).
+# Keep this comfortably above the number of concurrent sources; managed poolers such
+# as Neon accept far more than this.
+POOL_MAX_CONNECTIONS = max(4, int(os.environ.get("DB_POOL_MAX", "32")))
+POOL_WAIT_S = 0.05
 
 # The target fields the platform can consume. Keys are TARGET field names.
 TARGET_FIELDS = ("measurement_raw", "timestamp", "device_id")
@@ -56,6 +70,8 @@ TARGET_FIELDS = ("measurement_raw", "timestamp", "device_id")
 DEFAULT_RAW_COLUMN = "measurement_raw"
 _connection_pools = {}
 _connection_pools_lock = threading.Lock()
+_id_column_cache: dict[tuple, Optional[str]] = {}
+_id_column_lock = threading.Lock()
 
 
 def _lookup(data: Any, path: str):
@@ -103,6 +119,129 @@ def _flatten_keys(data: Any, prefix: str = "") -> list[str]:
     return keys
 
 
+class _SimpleConnectionPool:
+    """Small connection pool that creates connections outside its lock.
+
+    psycopg2's ThreadedConnectionPool holds one global lock while dialling a new
+    managed-Postgres connection. With many replay sources, one slow Neon/TLS
+    handshake then blocks every other poll for tens of seconds. Here connections
+    are opened by the calling worker; the lock only guards the counter.
+    """
+
+    def __init__(self, maxconn: int, connect_kwargs: dict):
+        self.maxconn = maxconn
+        self.connect_kwargs = connect_kwargs
+        self._idle: "queue.LifoQueue" = queue.LifoQueue(maxsize=maxconn)
+        self._created = 0
+        self._lock = threading.Lock()
+
+    def getconn(self, timeout: float = 5.0):
+        try:
+            return self._idle.get_nowait()
+        except queue.Empty:
+            pass
+        with self._lock:
+            create = self._created < self.maxconn
+            if create:
+                self._created += 1
+        if create:
+            try:
+                import psycopg2
+                return psycopg2.connect(**self.connect_kwargs)
+            except Exception:
+                with self._lock:
+                    self._created = max(0, self._created - 1)
+                raise
+        try:
+            return self._idle.get(timeout=timeout)
+        except queue.Empty:
+            from psycopg2.pool import PoolError
+            raise PoolError("connection pool exhausted")
+
+    def putconn(self, conn, close: bool = False, **_kwargs):
+        if close:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created = max(0, self._created - 1)
+            return
+        try:
+            self._idle.put_nowait(conn)
+        except queue.Full:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created = max(0, self._created - 1)
+
+
+# Query parameters that PostgREST adds to table paths; they are operations, not columns.
+_POSTGREST_RESERVED = {
+    "select", "order", "limit", "offset", "on_conflict", "columns", "and", "or", "not",
+    "include", "prefer", "range", "range-unit",
+}
+
+
+def _schema_columns(schema: Any) -> list[dict]:
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return []
+    columns: list[dict] = []
+    for name, spec in properties.items():
+        spec = spec if isinstance(spec, dict) else {}
+        dtype = spec.get("format") or spec.get("type") or ""
+        columns.append({"column": str(name), "type": str(dtype)})
+    return columns
+
+
+def _openapi_tables(spec: Any) -> list[dict]:
+    """Tables/columns from a PostgREST/Neon Data API OpenAPI document."""
+    if not isinstance(spec, dict):
+        return []
+    schemas = spec.get("definitions")
+    if not isinstance(schemas, dict):
+        components = spec.get("components")
+        schemas = components.get("schemas") if isinstance(components, dict) else None
+    tables: list[dict] = []
+    for name, schema in (schemas or {}).items():
+        columns = _schema_columns(schema)
+        if columns:
+            tables.append({"table": str(name), "columns": columns})
+    if tables:
+        return tables
+
+    for path, item in (spec.get("paths") or {}).items():
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("/rpc/"):
+            continue
+        table = path.strip("/")
+        if not table or "{" in table:
+            continue
+        columns = []
+        parameters = (item or {}).get("get", {}).get("parameters") if isinstance(item, dict) else None
+        for param in parameters or []:
+            if not isinstance(param, dict) or param.get("in") != "query":
+                continue
+            name = param.get("name")
+            if not name or name in _POSTGREST_RESERVED:
+                continue
+            columns.append({"column": str(name), "type": str(param.get("format") or param.get("type") or "")})
+        if columns:
+            tables.append({"table": table, "columns": columns})
+    return tables
+
+
+def _tables_from_payload(data: Any) -> Optional[list]:
+    if isinstance(data, dict):
+        tables = data.get("tables")
+        if isinstance(tables, list):
+            return [t for t in tables if isinstance(t, dict) and t.get("columns")]
+        return _openapi_tables(data) or None
+    return None
+
+
 @register
 class DatabaseApiConnector(DeviceDriver):
     driver_key = "database_api"
@@ -127,6 +266,22 @@ class DatabaseApiConnector(DeviceDriver):
         self.api_url = db.get("api_url") or self.config.get("api_url")
         self.api_key = db.get("api_key") or self.config.get("api_key")
         self.api_secret = db.get("api_secret") or db.get("secret_key") or self.config.get("api_secret")
+
+        # optional JWT refresh (Neon Auth / Better Auth). The service account
+        # signs in to mint a short-lived bearer token; the platform refreshes it.
+        self.auth_url = db.get("auth_url") or self.config.get("auth_url")
+        self.auth_email = db.get("auth_email") or self.config.get("auth_email")
+        self.auth_password = db.get("auth_password") or self.config.get("auth_password")
+        self.auth_origin = db.get("auth_origin") or self.config.get("auth_origin")
+        # Neon Data API: its auth service sits next to it, so API URL + API key
+        # (a session token) is enough; the token refresh URL is derived.
+        self._derived_auth_urls: list = []
+        if not self.auth_url and self.api_key and not self._looks_like_jwt(self.api_key):
+            self._derived_auth_urls = self._neon_auth_urls(self.api_url)
+            if self._derived_auth_urls:
+                self.auth_url = self._derived_auth_urls[0]
+        self._jwt: Optional[str] = None
+        self._jwt_expires_at = 0.0
 
         # target-field mapping: {target_field: source_column_or_json_path}
         mapping = db.get("mapping") or self.config.get("mapping") or {}
@@ -153,10 +308,15 @@ class DatabaseApiConnector(DeviceDriver):
         self.replay_loop = bool(replay.get("loop", True))
         self.replay_timestamp = str(replay.get("timestamp") or "now").lower()
         self.replay_time_column = replay.get("time_column")
-        self.replay_order_by = replay.get("order_by") or self.order_by
+        self.replay_order_by = replay.get("order_by")
+        # Optional: only replay rows whose sensor value actually changed, so long
+        # constant stretches in historical data do not look like a frozen dashboard.
+        self.replay_distinct_column = replay.get("distinct_column")
+        self.replay_valid_min = replay.get("valid_min")
+        self.replay_valid_max = replay.get("valid_max")
         self._time_column_cache = None
 
-        self.timeout = float(self.config.get("timeout", 5))
+        self.timeout = float(self.config.get("timeout", 15))
         self.simulate = bool(self.config.get("simulate", not self._configured()))
         self._t0 = time.time()
 
@@ -168,14 +328,15 @@ class DatabaseApiConnector(DeviceDriver):
 
     def _configured(self) -> bool:
         if self.mode == "customer":
-            return bool(self.api_url and self.api_key and self.api_secret)
+            refresh = self.auth_url and self.auth_email and self.auth_password
+            return bool(self.api_url and (self.api_key or self.api_secret or refresh))
         return bool(self.host and self.database and self.table)
 
     # ---- internal mode: direct database ---------------------------------
     def _connect(self):
         try:
-            import psycopg2
-            from psycopg2.pool import ThreadedConnectionPool
+            import psycopg2  # noqa: F401
+            from psycopg2.pool import PoolError
         except ImportError as exc:  # pragma: no cover
             raise DriverError("psycopg2 is required for an internal database connection.") from exc
         from ..services.source_guard import SourceBlocked, check_host
@@ -197,9 +358,15 @@ class DatabaseApiConnector(DeviceDriver):
         with _connection_pools_lock:
             pool = _connection_pools.get(key)
             if pool is None:
-                pool = ThreadedConnectionPool(minconn=1, maxconn=4, **kwargs)
+                pool = _SimpleConnectionPool(POOL_MAX_CONNECTIONS, kwargs)
                 _connection_pools[key] = pool
-        return pool, pool.getconn()
+        try:
+            return pool, pool.getconn(timeout=max(self.timeout, 1.0))
+        except PoolError as exc:
+            raise DriverError(
+                "Source database is busy (connection pool exhausted). "
+                "Lower the poll rate or disable some replay sources."
+            ) from exc
 
     @staticmethod
     def _release(connection_info, broken: bool = False) -> None:
@@ -251,6 +418,37 @@ class DatabaseApiConnector(DeviceDriver):
         parts = urllib.parse.urlsplit(self.api_url or "")
         return f"{parts.scheme}://{parts.netloc}"
 
+    def _url_with_path(self, url: str, suffix: str) -> str:
+        parts = urllib.parse.urlsplit(url or "")
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path.rstrip("/") + suffix, "", "")
+        )
+
+    def _is_postgrest(self) -> bool:
+        parts = urllib.parse.urlsplit(self.api_url or "")
+        return parts.path.rstrip("/").endswith("/rest/v1")
+
+    def _postgrest_table(self) -> tuple[str, Optional[str]]:
+        relation = self.table or ""
+        schema = None
+        if "." in relation:
+            schema, relation = relation.split(".", 1)
+        return relation, schema
+
+    def _postgrest_url(self) -> str:
+        relation, _schema = self._postgrest_table()
+        if not relation:
+            raise DriverError("Select a table exposed by this API before reading.")
+        parts = urllib.parse.urlsplit(self.api_url or "")
+        query = {"limit": "1"}
+        order = self.order_by or self.mapping.get("timestamp")
+        if order:
+            query["order"] = f"{order}.desc"
+        return urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, parts.path.rstrip("/") + "/" + urllib.parse.quote(relation),
+             urllib.parse.urlencode(query), parts.fragment)
+        )
+
     def _with_table(self, url: str) -> str:
         """Append ?table=<configured table> when the customer API is table-addressable."""
         if not self.table:
@@ -262,9 +460,168 @@ class DatabaseApiConnector(DeviceDriver):
             (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
         )
 
-    def _request_json(self, url: str) -> Any:
-        if not (url and self.api_key and self.api_secret):
-            raise DriverError("Customer API connection requires api_url, api_key and api_secret.")
+    def _auth_origin(self) -> str:
+        if self.auth_origin:
+            return self.auth_origin.rstrip("/")
+        from ..config import settings
+        base = (settings.public_base_url or "").rstrip("/")
+        if not base or "127.0.0.1" in base or "0.0.0.0" in base:
+            host = settings.app_host if settings.app_host not in ("", "0.0.0.0", "127.0.0.1") else "localhost"
+            base = f"http://{host}:{settings.app_port}"
+        return base
+
+    @staticmethod
+    def _jwt_expiry(token: str) -> Optional[float]:
+        try:
+            part = token.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(part).decode("utf-8"))
+            return float(claims["exp"])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _looks_like_jwt(token: str) -> bool:
+        return bool(token) and token.startswith("eyJ") and token.count(".") == 2
+
+    @staticmethod
+    def _neon_auth_urls(api_url: Optional[str]) -> list:
+        """Neon Auth URLs implied by a Neon Data API URL (`.apirest.` -> `.neonauth.`)."""
+        parts = urllib.parse.urlsplit(api_url or "")
+        host = parts.hostname or ""
+        if ".apirest." not in host or not host.endswith(".neon.tech"):
+            return []
+        auth_host = host.replace(".apirest.", ".neonauth.", 1)
+        database = parts.path.strip("/").split("/")[0]
+        names = dict.fromkeys(n for n in ("neondb", database) if n)
+        return [f"https://{auth_host}/{name}/auth" for name in names]
+
+    def _refresh_session_jwt(self) -> str:
+        """Exchange a long-lived session token (the API key) for a short-lived JWT."""
+        candidates = self._derived_auth_urls or [self.auth_url]
+        error: Optional[DriverError] = None
+        for url in candidates:
+            self.auth_url = url
+            try:
+                token = self._refresh_session_jwt_at()
+                self._derived_auth_urls = [url] if self._derived_auth_urls else []
+                return token
+            except DriverError as exc:
+                error = exc
+        raise error
+
+    def _refresh_session_jwt_at(self) -> str:
+        if not (self.auth_url and self.api_key):
+            raise DriverError("Session-token refresh requires auth_url and api_key.")
+        from ..services.source_guard import SourceBlocked, check_url
+        auth_url = self.auth_url.rstrip("/")
+        try:
+            check_url(auth_url)
+        except SourceBlocked as exc:
+            raise DriverError(str(exc)) from exc
+        origin = self._auth_origin()
+        first_error: Optional[Exception] = None
+        session_token = self.api_key or ""
+        if "=" in session_token:
+            name, value = session_token.split("=", 1)
+            if name.startswith(("__Secure-", "better-auth", "neon-auth")):
+                session_token = value
+        for cookie_name in (
+            "__Secure-neon-auth.session_token",
+            "neon-auth.session_token",
+            "better-auth.session_token",
+            "__Secure-better-auth.session_token",
+        ):
+            headers = {
+                "Accept": "application/json",
+                "Origin": origin,
+                "Cookie": f"{cookie_name}={session_token}",
+            }
+            req = urllib.request.Request(auth_url + "/get-session", headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
+                    token = response.headers.get("set-auth-jwt")
+                    response.read()
+                    if token:
+                        self._jwt = token
+                        self._jwt_expires_at = self._jwt_expiry(token) or (time.time() + 300)
+                        return token
+            except urllib.error.HTTPError as exc:
+                first_error = exc
+                try:
+                    exc.read()
+                except Exception:
+                    pass
+            except Exception as exc:
+                first_error = exc
+        message = "Auth service did not accept the API key (session token)."
+        if isinstance(first_error, urllib.error.HTTPError):
+            message = f"{message} HTTP {first_error.code}."
+        raise DriverError(message) from first_error
+
+    def _refresh_jwt(self) -> str:
+        """Sign in to the auth service and return a fresh JWT bearer token."""
+        if not (self.auth_url and self.auth_email and self.auth_password):
+            raise DriverError("JWT refresh requires auth_url, auth_email and auth_password.")
+        from ..services.source_guard import SourceBlocked, check_url
+        auth_url = self.auth_url.rstrip("/")
+        try:
+            check_url(auth_url)
+        except SourceBlocked as exc:
+            raise DriverError(str(exc)) from exc
+        origin = self._auth_origin()
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+        def request(path: str, data: Optional[bytes] = None) -> Optional[str]:
+            headers = {"Accept": "application/json", "Origin": origin}
+            if data is not None:
+                headers["Content-Type"] = "application/json"
+            req = urllib.request.Request(
+                auth_url + path, data=data, method="POST" if data is not None else "GET", headers=headers
+            )
+            try:
+                with opener.open(req, timeout=self.timeout) as response:  # noqa: S310
+                    token = response.headers.get("set-auth-jwt")
+                    response.read()
+                    return token
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read(2048).decode("utf-8", "replace").strip()
+                except Exception:
+                    pass
+                message = f"Auth sign-in failed: HTTP {exc.code}"
+                raise DriverError(f"{message}: {detail}" if detail else message) from exc
+            except Exception as exc:
+                raise DriverError(f"Auth sign-in failed: {exc}") from exc
+
+        payload = json.dumps({"email": self.auth_email, "password": self.auth_password}).encode()
+        token = request("/sign-in/email", payload)
+        if not token:
+            token = request("/get-session")
+        if not token:
+            raise DriverError("Auth service did not return a JWT (set-auth-jwt).")
+        self._jwt = token
+        self._jwt_expires_at = self._jwt_expiry(token) or (time.time() + 300)
+        return token
+
+    def _credential(self) -> Optional[str]:
+        refresh = (self.auth_url and self.api_key and not self._looks_like_jwt(self.api_key)) or (
+            self.auth_url and self.auth_email and self.auth_password
+        )
+        if refresh:
+            if not self._jwt or time.time() >= self._jwt_expires_at - 60:
+                if self.auth_email and self.auth_password:
+                    return self._refresh_jwt()
+                return self._refresh_session_jwt()
+            return self._jwt
+        return self.api_secret or self.api_key
+
+    def _request_json(self, url: str, extra_headers: Optional[dict] = None) -> Any:
+        credential = self._credential()
+        if not (url and credential):
+            raise DriverError("Customer API connection requires api_url and an API key/secret or auth credentials.")
         from ..services.source_guard import SourceBlocked, check_url
         try:
             check_url(url)
@@ -272,14 +629,26 @@ class DatabaseApiConnector(DeviceDriver):
             raise DriverError(str(exc)) from exc
         headers = {
             "Accept": "application/json",
-            "X-Api-Key": self.api_key,
-            "X-Api-Secret": self.api_secret,
-            "Authorization": f"Bearer {self.api_secret}",
+            "Authorization": f"Bearer {credential}",
         }
+        if self.api_key and not self.auth_url:
+            headers["X-Api-Key"] = self.api_key
+        if self.api_secret and not self.auth_url:
+            headers["X-Api-Secret"] = self.api_secret
+        if extra_headers:
+            headers.update(extra_headers)
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
                 body = response.read(MAX_RESPONSE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read(2048).decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            message = f"Customer API request failed: HTTP {exc.code}"
+            raise DriverError(f"{message}: {detail}" if detail else message) from exc
         except Exception as exc:
             raise DriverError(f"Customer API request failed: {exc}") from exc
         if len(body) > MAX_RESPONSE_BYTES:
@@ -290,16 +659,39 @@ class DatabaseApiConnector(DeviceDriver):
             raise DriverError("Customer API did not return JSON") from exc
 
     def _fetch_json(self) -> Any:
+        if self._is_postgrest():
+            _relation, schema = self._postgrest_table()
+            headers = {"Accept-Profile": schema} if schema else None
+            data = self._request_json(self._postgrest_url(), headers)
+            if isinstance(data, list):
+                return data[0] if data else None
+            return data
         return self._request_json(self._with_table(self.api_url))
 
     def _fetch_tables(self) -> Optional[list]:
-        """Ask the API for a table listing (GET <base>/tables). None when unsupported."""
-        try:
-            data = self._request_json(f"{self._api_base()}/tables")
-        except Exception:
-            return None
-        if isinstance(data, dict) and isinstance(data.get("tables"), list):
-            return [t for t in data["tables"] if isinstance(t, dict) and t.get("columns")]
+        """Ask the API for a table listing. None when unsupported.
+
+        Tries the OpenAPI document (PostgREST/Neon Data API) and the `/tables`
+        listing of our generic customer API. For a PostgREST endpoint, the first
+        error (usually an auth/JWT problem) is surfaced instead of being hidden.
+        """
+        candidates = (
+            self._url_with_path(self.api_url, "/openapi.json"),
+            self._url_with_path(self.api_url, "/tables"),
+            f"{self._api_base()}/tables",
+        )
+        first_error: Optional[Exception] = None
+        for url in candidates:
+            try:
+                data = self._request_json(url)
+            except Exception as exc:
+                first_error = first_error or exc
+                continue
+            tables = _tables_from_payload(data)
+            if tables:
+                return tables
+        if self._is_postgrest() and first_error:
+            raise first_error
         return None
 
     def _read_customer(self) -> dict:
@@ -407,7 +799,33 @@ class DatabaseApiConnector(DeviceDriver):
         return self._time_column_cache
 
     def _replay_order_column(self) -> Optional[str]:
-        return self.replay_order_by or self._replay_time_column()
+        if self.replay_order_by:
+            return self.replay_order_by
+        # Prefer an integer key (usually the primary key) so replay advances with an
+        # index scan. Ordering by a non-indexed timestamp column scans the whole
+        # history on every poll, which makes a busy dashboard crawl.
+        return self._replay_id_column() or self._replay_time_column() or self.order_by
+
+    def _replay_id_column(self) -> Optional[str]:
+        key = (self.host, self.port, self.database, self.table)
+        with _id_column_lock:
+            if key in _id_column_cache:
+                return _id_column_cache[key]
+        schema, table = self._table_parts()
+        with self._database_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s "
+                    "AND data_type IN ('bigint', 'integer', 'smallint') "
+                    "ORDER BY (column_name = 'id') DESC, ordinal_position LIMIT 1",
+                    (schema, table),
+                )
+                row = cur.fetchone()
+        value = row[0] if row else None
+        with _id_column_lock:
+            _id_column_cache[key] = value
+        return value
 
     @staticmethod
     def _cursor_kind(cursor):
@@ -440,6 +858,25 @@ class DatabaseApiConnector(DeviceDriver):
             if self.replay_to:
                 where.append(f"{quote_ident(time_col)} <= %s::timestamptz")
                 params.append(str(self.replay_to))
+
+        distinct_col = self.replay_distinct_column
+        if distinct_col:
+            col = quote_ident(distinct_col)
+            where.append(f"{col} IS NOT NULL")
+            if self.replay_valid_min is not None:
+                where.append(f"{col} >= %s")
+                params.append(float(self.replay_valid_min))
+            if self.replay_valid_max is not None:
+                where.append(f"{col} <= %s")
+                params.append(float(self.replay_valid_max))
+            if cursor is not None:
+                cursor_cast = "" if isinstance(cursor, int) else "::timestamptz"
+                where.append(
+                    f"{col} IS DISTINCT FROM (SELECT {col} FROM {quote_ident(self.table)} "
+                    f"WHERE {quote_ident(order_col)} = %s{cursor_cast})"
+                )
+                params.append(cursor)
+
         if cursor is not None:
             if isinstance(cursor, int):
                 where.append(f"{quote_ident(order_col)} > %s")

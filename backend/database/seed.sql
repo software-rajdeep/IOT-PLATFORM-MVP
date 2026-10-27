@@ -47,7 +47,10 @@ INSERT INTO core.application_templates
 SELECT
   v.template_id, v.name, '1.0', 'quality_measurement', v.sensor_layout, v.description,
   'height_thickness', NULL,
-  CASE WHEN v.template_id = 'side_by_side_sensors_v1' THEN 'sbs_thickness' ELSE 'rubber_thickness' END,
+  CASE WHEN v.template_id IN ('side_by_side_sensors_v1', 'sbs_reference_v1')
+       THEN 'sbs_thickness'
+       WHEN v.template_id = 'opposite_side_sensors_v1' THEN 'opposite_thickness'
+       ELSE 'rubber_thickness' END,
   '[
      {"key":"thickness.target_mm","label":"Nominal thickness","type":"decimal","default":8.5,"unit":"mm"},
      {"key":"thickness.lower_limit_mm","label":"Lower limit","type":"decimal","default":8.3,"unit":"mm"},

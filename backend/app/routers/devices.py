@@ -31,7 +31,8 @@ class DatabaseApiIn(BaseModel):
 
     Two modes:
       - internal  : database we reach directly (our DB, or supplied credentials).
-      - customer  : the customer's own server, reachable only via API key+secret.
+      - customer  : the customer's own server, reachable via an API URL + API key
+                    (an additional secret key is optional).
 
     `mapping` maps the platform's TARGET fields onto the customer's source:
         {"measurement_raw": "<column or json.path>",
@@ -57,8 +58,19 @@ class DatabaseApiIn(BaseModel):
     api_secret: Optional[str] = None
     value_field: Optional[str] = None  # legacy single-field mapping
 
+    # optional JWT refresh (e.g. Neon Auth): sign in with a service account
+    auth_url: Optional[str] = None
+    auth_email: Optional[str] = None
+    auth_password: Optional[str] = None
+    auth_origin: Optional[str] = None
+
     # target-field mapping
     mapping: Optional[dict] = None
+
+    # replay historical rows while the sensor is offline:
+    #   {"enabled": true, "from": "...", "to": "...", "step": 1,
+    #    "loop": true, "timestamp": "now"}
+    replay: Optional[dict] = None
 
 
 class ConnectionIn(BaseModel):
@@ -289,17 +301,26 @@ def test_device(device_id: str, user: dict = Depends(get_current_user)) -> dict:
     if not connector_cls:
         raise HTTPException(status_code=400, detail=f"No connector for {driver_key}")
     payload = None
+    replay = False
     try:
         connector = connector_cls(connector_config(device), {"centre_distance": device.get("centre_distance")})
         connected = connector.checkConnection()
-        reading = connector.readMeasurement() if connected else None
-        if connected and not connector.simulate and hasattr(connector, "read_payload"):
-            payload = connector.read_payload()
+        reading = None
+        replay = bool(getattr(connector, "replay", False))
+        if connected:
+            if replay and hasattr(connector, "read_replay_payload"):
+                result = connector.read_replay_payload(None)
+                payload = result[0] if result else None
+            elif not connector.simulate and hasattr(connector, "read_payload"):
+                payload = connector.read_payload()
+            else:
+                reading = connector.readMeasurement()
         connector.disconnect()
     except Exception as exc:
         return {"connected": False, "error": str(exc)}
     if payload is not None:
-        return {"connected": True, "interface": driver_key, "communication_status": "online", "payload": payload}
+        return {"connected": True, "interface": driver_key, "communication_status": "online",
+                "replay": replay, "payload": payload}
     resolution = float(device["resolution"]) if device.get("resolution") is not None else 0.01
     raw = reading.get("measurement_raw") if reading else None
     return {

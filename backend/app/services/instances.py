@@ -59,7 +59,7 @@ def _steps(config: dict, status: str, row: Optional[dict] = None) -> dict:
     roles = _json((row or {}).get("field_roles"), {}) or {
         "target": "thickness.target_mm", "lower": "thickness.lower_limit_mm", "upper": "thickness.upper_limit_mm"}
     commissioning = _json((row or {}).get("commissioning"), {})
-    needs_cal = commissioning.get("calibration") == "two_point"
+    needs_cal = commissioning.get("calibration") in ("two_point", "baseline", "gap", "auto_gap")
     limit_keys = [roles[k] for k in ("lower", "upper") if roles.get(k)]
     return {
         "connection": True,

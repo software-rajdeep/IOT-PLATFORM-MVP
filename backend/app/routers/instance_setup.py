@@ -221,7 +221,7 @@ def checklist(instance_id: str, row: dict, template: dict) -> list[dict]:
         {"key": "data", "label": "Data flowing (readings in the last 10 min)", "ok": bool(recent and recent["n"]),
          "required": False, "detail": f"{recent['n'] if recent else 0} readings"},
     ]
-    if (template.get("commissioning") or {}).get("calibration") == "two_point":
+    if (template.get("commissioning") or {}).get("calibration") in ("two_point", "baseline", "gap", "auto_gap"):
         items.append({"key": "calibration", "label": "Calibrated with reference pieces", "required": True,
                       "ok": config.get("calibration.calibrated_at") not in (None, ""),
                       "detail": f"by {config.get('calibration.calibrated_by')} at {config.get('calibration.calibrated_at')}"

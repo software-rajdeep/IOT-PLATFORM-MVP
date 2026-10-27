@@ -44,7 +44,7 @@ def list_devices(company_id: str) -> list[dict]:
     return fetch_all(DEVICE_SELECT + " WHERE d.company_id = %s ORDER BY d.created_at DESC", (company_id,))
 
 
-SECRET_KEYS = ("password", "api_secret", "secret_key")
+SECRET_KEYS = ("password", "api_key", "api_secret", "secret_key", "auth_password")
 
 
 def split_secrets(database: Optional[dict]) -> tuple[dict, dict]:
@@ -67,7 +67,7 @@ def connector_config(device: dict) -> dict:
         "simulate": params.get("simulate", True),
         "baud_rate": device.get("baud_rate"),
         "address": device.get("conn_address") or device.get("device_address"),
-        "timeout": params.get("timeout", 0.5),
+        "timeout": params.get("timeout", 10 if str(device.get("interface") or "").lower() == "database_api" else 0.5),
     }
     config.update({k: v for k, v in params.items() if k not in config})
     return config

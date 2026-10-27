@@ -15,7 +15,7 @@ Configuration is all environment (nothing customer-specific is hard-coded):
     TABLE               schema.table       (default public.rubber)
     ORDER_BY            column             (default id)
     CUSTOMER_API_KEY    the API key the customer issues        (default neon-customer-key)
-    CUSTOMER_API_SECRET the secret key the customer issues     (default neon-customer-secret)
+    CUSTOMER_API_SECRET the secret key the customer issues     (optional; empty = key-only auth)
 
 Run (from the repo root):
 
@@ -47,8 +47,16 @@ def _quote_ident(name: str) -> str:
 
 
 def _require_auth(api_key: Optional[str], api_secret: Optional[str]) -> None:
-    if api_key != API_KEY or api_secret != API_SECRET:
+    if API_SECRET:
+        ok = api_key == API_KEY and api_secret == API_SECRET
+    else:
+        ok = (api_key or api_secret) == API_KEY
+    if not ok:
         raise HTTPException(status_code=401, detail="Invalid API key or secret")
+
+
+def _resolve_table(table: Optional[str]) -> str:
+    return table or TABLE
 
 
 def _connect():
@@ -60,13 +68,15 @@ def _json_safe(value):
 
 
 @app.get("/api/latest")
-def latest(x_api_key: Optional[str] = Header(default=None), x_api_secret: Optional[str] = Header(default=None)) -> dict:
+def latest(table: Optional[str] = None, x_api_key: Optional[str] = Header(default=None),
+           x_api_secret: Optional[str] = Header(default=None)) -> dict:
     """The customer's newest reading row, returned under their own column names."""
     _require_auth(x_api_key, x_api_secret)
+    name = _resolve_table(table)
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM {_quote_ident(TABLE)} ORDER BY {_quote_ident(ORDER_BY)} DESC LIMIT 1")
+            cur.execute(f"SELECT * FROM {_quote_ident(name)} ORDER BY {_quote_ident(ORDER_BY)} DESC LIMIT 1")
             row = cur.fetchone()
     finally:
         conn.close()
@@ -76,23 +86,25 @@ def latest(x_api_key: Optional[str] = Header(default=None), x_api_secret: Option
 
 
 @app.get("/tables")
-def tables(x_api_key: Optional[str] = Header(default=None), x_api_secret: Optional[str] = Header(default=None)) -> dict:
+def tables(table: Optional[str] = None, x_api_key: Optional[str] = Header(default=None),
+           x_api_secret: Optional[str] = Header(default=None)) -> dict:
     """Table/column listing so the platform's discovery can offer the columns for mapping."""
     _require_auth(x_api_key, x_api_secret)
-    schema = TABLE.split(".")[0] if "." in TABLE else "public"
-    name = TABLE.split(".")[-1]
+    name = _resolve_table(table)
+    schema = name.split(".")[0] if "." in name else "public"
+    rel = name.split(".")[-1]
     conn = _connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT column_name, data_type FROM information_schema.columns "
                 "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
-                (schema, name),
+                (schema, rel),
             )
             rows = cur.fetchall()
     finally:
         conn.close()
-    return {"tables": [{"table": TABLE, "columns": [{"column": r["column_name"], "type": r["data_type"]} for r in rows]}]}
+    return {"tables": [{"table": name, "columns": [{"column": r["column_name"], "type": r["data_type"]} for r in rows]}]}
 
 
 @app.get("/health")

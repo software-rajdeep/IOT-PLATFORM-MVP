@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,16 +33,18 @@ from .services.processing import ingest_raw
 
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
-_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="source")
+_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="source")
 _in_flight: set[str] = set()
 _next_due: dict[str, float] = {}
 _last_hash: dict[str, str] = {}
 _last_error: dict[str, Optional[str]] = {}
 _sources_cache: list[dict] = []
 _sources_cache_at = 0.0
+_offline_in_flight = False
 _t0 = time.time()
 MIN_INTERVAL_S = 0.5
 SOURCE_REFRESH_S = 1.0
+OFFLINE_CHECK_S = 10.0
 
 
 def _as_dict(value) -> dict:
@@ -83,7 +86,9 @@ def _centre_displacement(device_id: str) -> Optional[float]:
 
 
 def _record_error(device_id: str, message: Optional[str]) -> None:
-    if _last_error.get(device_id) == message:
+    if message is not None and _last_error.get(device_id) == message:
+        return
+    if message is None and device_id in _last_error and _last_error.get(device_id) is None:
         return
     _last_error[device_id] = message
     if message:
@@ -156,8 +161,18 @@ def _run(device_id: str) -> None:
         _in_flight.discard(device_id)
 
 
+def _check_offline() -> None:
+    global _offline_in_flight
+    try:
+        alerts.check_offline()
+    except Exception as exc:
+        print(f"[sources] offline check error: {exc}")
+    finally:
+        _offline_in_flight = False
+
+
 def _loop() -> None:
-    global _sources_cache_at
+    global _sources_cache_at, _offline_in_flight
     last_offline_check = 0.0
     while not _stop.is_set():
         now = time.monotonic()
@@ -177,9 +192,10 @@ def _loop() -> None:
                 _next_due[device_id] = now + interval
                 _in_flight.add(device_id)
                 _pool.submit(_run, device_id)
-            if now - last_offline_check > 5:
+            if now - last_offline_check > OFFLINE_CHECK_S and not _offline_in_flight:
                 last_offline_check = now
-                alerts.check_offline()
+                _offline_in_flight = True
+                threading.Thread(target=_check_offline, name="offline-check", daemon=True).start()
         except Exception as exc:
             print(f"[sources] loop error: {exc}")
         _stop.wait(0.1)

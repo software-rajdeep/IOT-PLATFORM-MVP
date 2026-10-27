@@ -12,12 +12,29 @@ from pydantic import BaseModel
 
 from ..db import execute, fetch_all, fetch_one, get_cursor
 from ..deps import get_current_user, require_company
-from ..services.calibration import compute_linear, current_displacement
+from ..services.calibration import compute_linear, current_displacement, latest_fields
 from ..services.dashboard import build_dashboard
 from ..services.devices import DEVICE_SELECT, load_device, resolve_plant, serialize_device
 from ..services.instances import get_instance, instance_device_ids, list_instances, load_config, serialize_instance, set_config
+from ..services.limits import bounds as limit_bounds
 from ..services import alerts, audit
 from ..services.mappings import ensure_initial_mapping
+from ..services.opposite_calibration import (
+    auto_gap_active,
+    auto_gap_total,
+    distance_mm,
+    gap_distance,
+    object_thickness,
+    tolerance,
+    tolerance_limits,
+    ZERO_OFFSET_MM,
+)
+from ..services.sbs_calibration import (
+    DEFAULT_INPUT_KEY,
+    parse_baselines,
+    reference_key,
+    sensor_readings,
+)
 from ..services.templates import load_template
 from ..services.live_updates import subscribe
 
@@ -72,6 +89,16 @@ def _owned(instance_id: str, user: dict) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Instance not found")
     return row
+
+
+def _input_key(template: dict) -> str:
+    roles = template.get("field_roles") or {}
+    if roles.get("input"):
+        return roles["input"]
+    for spec in template.get("requires") or []:
+        if spec.get("required", True):
+            return spec["key"]
+    return DEFAULT_INPUT_KEY
 
 
 class AddInstanceDeviceRequest(BaseModel):
@@ -252,6 +279,227 @@ def calibrate(instance_id: str, body: CalibrateRequest, user: dict = Depends(get
               {"scale": scale, "offset": offset, "references": [[body.reference_1_thickness, d1], [body.reference_2_thickness, d2]]})
     return {"calibration.scale": scale, "calibration.offset": offset,
             "reference_1_displacement": d1, "reference_2_displacement": d2}
+
+
+class BaselineCalibrateRequest(BaseModel):
+    reference_thickness: float
+    readings: Optional[dict] = None
+
+
+def _calibration_live(row: dict) -> dict:
+    template = load_template(row["template_id"])
+    config = load_config(row["instance_id"])
+    processor = template.get("processor_key") or ""
+    device = load_device(row.get("device_id")) if row.get("device_id") else None
+    connection = _json((device or {}).get("connection_parameters"), {})
+    source_mode = "replay" if _json((connection.get("database") or {}).get("replay"), {}).get("enabled") else (
+        "simulated" if connection.get("simulate") else "live")
+    is_opposite = processor == "opposite_thickness"
+    input_key = _input_key(template)
+    fields, ts = latest_fields(row["instance_id"], row.get("device_id"))
+    readings = sensor_readings(fields, input_key)
+    keys = [key for key, _ in readings]
+    ref_key = reference_key(config, keys)
+    baselines = parse_baselines(config)
+    sensors = []
+    for index, (key, value) in enumerate(readings):
+        item = {
+            "key": key,
+            "label": f"Sensor {index + 1}",
+            "value": value,
+            "thickness": None,
+            "error": None,
+            "is_reference": key == ref_key,
+        }
+        if is_opposite:
+            item["distance"] = distance_mm(value)
+        sensors.append(item)
+    lower, upper, limit_active = limit_bounds(
+        config, "thickness.limit_active", "thickness.lower_limit_mm", "thickness.upper_limit_mm")
+    return {
+        "input_key": input_key,
+        "processor_key": processor,
+        "source_mode": source_mode,
+        "sensor_layout": template.get("sensor_layout"),
+        "ts": ts,
+        "fields": fields,
+        "sensors": sensors,
+        "sensor_count": len(sensors),
+        "reference_sensor_key": ref_key,
+        "reference_thickness": config.get("calibration.reference_thickness"),
+        "baselines": baselines,
+        "calibrated_at": config.get("calibration.calibrated_at"),
+        "calibrated_by": config.get("calibration.calibrated_by"),
+        "mode": config.get("calibration.mode") or "auto",
+        "limits": {"active": limit_active, "lower": lower, "upper": upper},
+        "gap": {
+            "distance": gap_distance(config),
+            "auto": auto_gap_active(config),
+            "object_thickness": object_thickness(config),
+            "tolerance": tolerance(config),
+            "zero_offset_mm": ZERO_OFFSET_MM,
+        },
+        "reference_limits": {
+            "active": str(config.get("reference.limit_active") or "").lower() in {"1", "true", "yes", "on"},
+            "lower": config.get("reference.lower_limit_mm"),
+            "upper": config.get("reference.upper_limit_mm"),
+        },
+    }
+
+
+@router.get("/{instance_id}/calibration/live")
+def calibration_live(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    return _calibration_live(_owned(instance_id, user))
+
+
+@router.post("/{instance_id}/calibrate/baseline")
+def calibrate_baseline(instance_id: str, body: BaselineCalibrateRequest,
+                       user: dict = Depends(get_current_user)) -> dict:
+    row = _owned(instance_id, user)
+    template = load_template(row["template_id"])
+    input_key = _input_key(template)
+    config = load_config(instance_id)
+    if body.reference_thickness < 0:
+        raise HTTPException(status_code=400, detail="Reference thickness must be zero or greater.")
+
+    if body.readings is not None:
+        readings = sensor_readings(body.readings, input_key)
+    else:
+        readings = sensor_readings(latest_fields(instance_id, row.get("device_id"))[0], input_key)
+    if not readings:
+        raise HTTPException(status_code=400, detail="No sensor readings received yet. Wait for data and try again.")
+
+    baselines = {key: round(value, 6) for key, value in readings}
+    keys = list(baselines)
+    ref_key = reference_key(config, keys)
+    calibrated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    before = {key: config.get(key) for key in (
+        "calibration.mode", "calibration.baselines", "calibration.reference_thickness",
+        "calibration.reference_sensor_key", "calibration.calibrated_at",
+    )}
+    set_config(instance_id, {
+        "calibration.mode": "baseline",
+        "calibration.baselines": json.dumps(baselines),
+        "calibration.reference_thickness": round(body.reference_thickness, 6),
+        "calibration.reference_sensor_key": ref_key or "",
+        "calibration.calibrated_at": calibrated_at,
+        "calibration.calibrated_by": user["username"],
+    })
+    audit.log(user, "calibration.baseline", "instance", instance_id, before,
+              {"reference_thickness": body.reference_thickness, "baselines": baselines,
+               "reference_sensor_key": ref_key})
+    return {
+        "calibration.mode": "baseline",
+        "calibration.reference_thickness": round(body.reference_thickness, 6),
+        "calibration.baselines": baselines,
+        "calibration.reference_sensor_key": ref_key,
+        "calibration.calibrated_at": calibrated_at,
+        "calibration.calibrated_by": user["username"],
+    }
+
+
+@router.post("/{instance_id}/calibration/reset")
+def reset_calibration(instance_id: str, user: dict = Depends(get_current_user)) -> dict:
+    row = _owned(instance_id, user)
+    before = load_config(instance_id)
+    with get_cursor(commit=True) as cur:
+        cur.execute(
+            "DELETE FROM core.template_config WHERE instance_id = %s AND config_key = ANY(%s)",
+            (instance_id, [
+                "calibration.baselines", "calibration.reference_thickness",
+                "calibration.reference_sensor_key", "calibration.calibrated_at",
+                "calibration.calibrated_by", "calibration.mode",
+                "calibration.gap_distance", "calibration.object_thickness",
+                "calibration.tolerance_mm",
+            ]),
+        )
+    audit.log(user, "calibration.reset", "instance", instance_id,
+              {key: before.get(key) for key in (
+                  "calibration.baselines", "calibration.reference_thickness",
+                  "calibration.gap_distance", "calibration.object_thickness",
+                  "calibration.tolerance_mm",
+                  "calibration.calibrated_at", "calibration.calibrated_by")}, None)
+    return {"ok": True, "calibrated": False, "instance": serialize_instance(get_instance(instance_id, require_company(user)))}
+
+
+class OppositeCalibrateRequest(BaseModel):
+    gap_distance: Optional[float] = None
+    object_thickness: Optional[float] = None
+    tolerance_mm: Optional[float] = None
+    readings: Optional[dict] = None
+
+
+@router.post("/{instance_id}/calibrate/opposite")
+def calibrate_opposite(instance_id: str, body: OppositeCalibrateRequest,
+                       user: dict = Depends(get_current_user)) -> dict:
+    """Manual gap or auto-gap commissioning for opposite-side sensors.
+
+    Manual: the distance between the two sensor faces is entered directly.
+    Auto:   the known object thickness plus the current A/B readings derive the
+            total gap (2 * 35 + A + B + thickness); the optional tolerance becomes
+            the thickness lower/upper limits, exactly like the old appliance.
+    """
+    row = _owned(instance_id, user)
+    template = load_template(row["template_id"])
+    if (template.get("processor_key") or "") != "opposite_thickness":
+        raise HTTPException(status_code=400, detail="This application is not an opposite-side sensor layout.")
+    input_key = _input_key(template)
+    config = load_config(instance_id)
+    calibrated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    updates: dict[str, Any] = {
+        "calibration.calibrated_at": calibrated_at,
+        "calibration.calibrated_by": user["username"],
+    }
+    captured = None
+
+    if body.gap_distance is not None:
+        if body.gap_distance <= 0:
+            raise HTTPException(status_code=400, detail="Gap distance must be greater than zero.")
+        updates["calibration.mode"] = "gap"
+        updates["calibration.gap_distance"] = round(float(body.gap_distance), 6)
+        if body.object_thickness is not None:
+            if body.object_thickness <= 0:
+                raise HTTPException(status_code=400, detail="Object thickness must be greater than zero.")
+            updates["calibration.object_thickness"] = round(float(body.object_thickness), 6)
+            updates["thickness.target_mm"] = round(float(body.object_thickness), 6)
+    elif body.object_thickness is not None:
+        if body.object_thickness <= 0:
+            raise HTTPException(status_code=400, detail="Object thickness must be greater than zero.")
+        fields = body.readings if body.readings is not None else latest_fields(
+            instance_id, row.get("device_id"))[0]
+        readings = sensor_readings(fields, input_key)
+        if len(readings) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Auto-gap needs both sensor readings. Map both sensor columns and wait for data.")
+        (key_a, reading_a), (key_b, reading_b) = readings[0], readings[1]
+        captured = {key_a: round(reading_a, 6), key_b: round(reading_b, 6)}
+        total_gap = auto_gap_total(reading_a, reading_b, body.object_thickness)
+        updates["calibration.mode"] = "auto_gap"
+        updates["calibration.gap_distance"] = total_gap
+        updates["calibration.object_thickness"] = round(float(body.object_thickness), 6)
+        updates["thickness.target_mm"] = round(float(body.object_thickness), 6)
+        if body.tolerance_mm is not None:
+            if body.tolerance_mm < 0:
+                raise HTTPException(status_code=400, detail="Tolerance must be zero or greater.")
+            lower, upper = tolerance_limits(body.object_thickness, body.tolerance_mm)
+            updates["calibration.tolerance_mm"] = round(abs(float(body.tolerance_mm)), 6)
+            updates["thickness.lower_limit_mm"] = lower
+            updates["thickness.upper_limit_mm"] = upper
+            updates["thickness.limit_active"] = True
+    else:
+        raise HTTPException(status_code=400, detail="Enter a gap distance or an object thickness.")
+
+    before = {key: config.get(key) for key in updates}
+    set_config(instance_id, updates)
+    audit.log(user, "calibration.opposite", "instance", instance_id, before, updates)
+    return {
+        **updates,
+        "captured_readings": captured,
+        "sensor_count": len(sensor_readings(
+            body.readings if body.readings is not None else latest_fields(
+                instance_id, row.get("device_id"))[0], input_key)),
+    }
 
 
 class VerifyCalibrationRequest(BaseModel):

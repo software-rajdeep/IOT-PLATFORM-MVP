@@ -8,8 +8,8 @@ import { stepper } from "./stepper.js";
 // step 3 (mapping), because we never know a customer's schema up front.
 const SOURCES = [
   { key: "gateway", title: "Rajdeep gateway", sub: "Our sensor wired over RS-485 (serial port or serial-to-Ethernet). Auto-mapped." },
-  { key: "api", title: "Customer API (pull)", sub: "They give an API URL + key + secret. We poll it and map their JSON." },
-  { key: "db", title: "Customer database (pull)", sub: "Read-only DB access. Pick the table; we read the newest row." },
+  { key: "api", title: "Customer API (pull)", sub: "They give an API URL + API key (e.g. Neon Data API). We poll it and map their data." },
+  { key: "db", title: "Customer database (pull)", sub: "Read-only DB access. Pick the table; read the newest row, or replay old rows while the sensor is offline." },
   { key: "push", title: "HTTP push", sub: "Their system posts JSON to a URL we issue, with a device key." },
 ];
 
@@ -54,17 +54,28 @@ export async function renderConnection(view, ctx, setCleanup) {
             </div>
 
             <div id="src-api" class="src-fields hidden">
-              <div class="field"><label>API URL</label><input id="api-url" placeholder="https://customer.example.com/api/latest" /></div>
-              <div class="grid cols-2" style="gap:10px">
-                <div class="field"><label>API key</label><input id="api-key" /></div>
-                <div class="field"><label>Secret key</label><input id="api-secret" type="password" /></div>
-              </div>
+              <div class="field"><label>API URL</label><input id="api-url" placeholder="https://ep-....apirest....neon.tech/<db>/rest/v1" /></div>
+              <div class="field"><label>API key</label><input id="api-key" type="password" /></div>
+              <div class="hint">That is all a Neon Data API needs — token refresh is handled automatically.</div>
+              <details class="hint" style="margin:6px 0">
+                <summary>Advanced (other APIs)</summary>
+                <div class="field"><label>Secret key (optional)</label><input id="api-secret" type="password" />
+                  <div class="hint">Sent as <b>Authorization: Bearer</b> plus <b>X-Api-Key</b> / <b>X-Api-Secret</b> when supplied.</div></div>
+                <div class="field"><label>Token refresh URL (optional)</label><input id="api-auth-url" placeholder="https://...neonauth..../neondb/auth" />
+                  <div class="hint">Only for non-Neon APIs that issue short-lived JWTs. Neon's is detected from the API URL.</div></div>
+                <div class="grid cols-2" style="gap:10px">
+                  <div class="field"><label>Service account email</label><input id="api-auth-email" /></div>
+                  <div class="field"><label>Password</label><input id="api-auth-password" type="password" /></div>
+                </div>
+                <div class="hint">Alternative to the API key: the platform signs in and refreshes the bearer token itself.</div>
+              </details>
               <div class="field"><label>Poll every (ms)</label><input id="api-poll" type="number" value="1000" /></div>
               <button type="button" class="btn-ghost" id="demo-fill">Use the demo customer's line API</button>
               <button class="btn secondary btn-sm" id="api-discover" type="button">Discover tables</button>
               <div id="api-discover-result" class="hint" style="margin:8px 0"></div>
               <div id="api-table-wrap" class="hidden">
                 <div class="field"><label>Table exposed by the API</label><select id="api-table"></select></div>
+                <div class="field"><label>Newest-row column (order by)</label><select id="api-order"></select></div>
                 <div id="api-cols" style="margin-top:8px"></div>
               </div>
             </div>
@@ -92,6 +103,32 @@ export async function renderConnection(view, ctx, setCleanup) {
                 <div id="db-cols" style="margin-top:8px"></div>
               </div>
               <div class="field"><label>Poll every (ms)</label><input id="db-poll" type="number" value="1000" /></div>
+              <div class="field inline"><input type="checkbox" id="db-replay" /><label for="db-replay">Replay old readings (sensor offline)</label></div>
+              <div id="db-replay-fields" class="hidden">
+                <div class="hint">Walk through the table's existing rows and feed them to the dashboard as if they were live.
+                  Pick a time window where the value actually changes — replaying a long constant stretch looks frozen.</div>
+                <div class="grid cols-2" style="gap:10px">
+                  <div class="field"><label>From (optional)</label><input id="db-replay-from" type="datetime-local" /></div>
+                  <div class="field"><label>To (optional)</label><input id="db-replay-to" type="datetime-local" /></div>
+                </div>
+                <div class="grid cols-2" style="gap:10px">
+                  <div class="field"><label>Rows per poll</label><input id="db-replay-step" type="number" min="1" value="1" /></div>
+                  <div class="field"><label>Timestamp</label><select id="db-replay-timestamp">
+                    <option value="now">Current time (graph keeps moving)</option>
+                    <option value="source">Original row time</option>
+                  </select></div>
+                </div>
+                <div class="field inline"><input type="checkbox" id="db-replay-loop" checked /><label for="db-replay-loop">Loop when the end is reached</label></div>
+                <div class="grid cols-2" style="gap:10px">
+                  <div class="field"><label>Only when this column changes (optional)</label><select id="db-replay-column"></select></div>
+                  <div class="field"><label>Valid range (optional)</label>
+                    <div class="grid cols-2" style="gap:6px">
+                      <input id="db-replay-min" type="number" step="any" placeholder="min" />
+                      <input id="db-replay-max" type="number" step="any" placeholder="max" />
+                    </div></div>
+                </div>
+                <div class="hint">Pick the sensor column to skip long constant stretches in old data, so the graph keeps moving.</div>
+              </div>
             </div>
 
             <div id="src-push" class="src-fields hidden">
@@ -144,6 +181,23 @@ export async function renderConnection(view, ctx, setCleanup) {
     $(id).innerHTML = `<option value="">— select —</option>` + options.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join("");
   }
 
+  function replayConfig() {
+    if (!$("db-replay").checked) return { enabled: false };
+    const from = $("db-replay-from").value;
+    const to = $("db-replay-to").value;
+    return {
+      enabled: true,
+      from: from ? new Date(from).toISOString() : null,
+      to: to ? new Date(to).toISOString() : null,
+      step: Math.max(1, parseInt($("db-replay-step").value, 10) || 1),
+      loop: $("db-replay-loop").checked,
+      timestamp: $("db-replay-timestamp").value || "now",
+      distinct_column: $("db-replay-column").value || null,
+      valid_min: $("db-replay-min").value === "" ? null : Number($("db-replay-min").value),
+      valid_max: $("db-replay-max").value === "" ? null : Number($("db-replay-max").value),
+    };
+  }
+
   function dbConnection() {
     return {
       mode: "internal", host: $("db-host").value.trim() || null, port: parseInt($("db-port").value, 10) || null,
@@ -151,6 +205,18 @@ export async function renderConnection(view, ctx, setCleanup) {
       password: $("db-pass").value || null, sslmode: $("db-sslmode").value || null,
     };
   }
+
+  function apiAuth() {
+    return {
+      auth_url: $("api-auth-url").value.trim() || null,
+      auth_email: $("api-auth-email").value.trim() || null,
+      auth_password: $("api-auth-password").value || null,
+    };
+  }
+
+  $("db-replay").addEventListener("change", () => {
+    $("db-replay-fields").classList.toggle("hidden", !$("db-replay").checked);
+  });
 
   $("db-discover").addEventListener("click", async (event) => {
     const btn = event.currentTarget;
@@ -178,6 +244,7 @@ export async function renderConnection(view, ctx, setCleanup) {
     const t = tables.find((x) => x.table === e.target.value);
     const cols = t ? t.columns : [];
     fillSelect("db-order", cols.map((c) => c.column));
+    fillSelect("db-replay-column", cols.map((c) => c.column));
     const guess = cols.find((c) => c.category === "datetime") || cols.find((c) => /time|date|ts/i.test(c.column));
     if (guess) $("db-order").value = guess.column;
     $("db-cols").innerHTML = t ? `
@@ -197,7 +264,7 @@ export async function renderConnection(view, ctx, setCleanup) {
       const res = await api.discoverSource({
         connection: { interface: "database_api", simulate: false,
           database: { mode: "customer", api_url: $("api-url").value.trim(),
-            api_key: $("api-key").value.trim(), api_secret: $("api-secret").value } },
+            api_key: $("api-key").value.trim(), api_secret: $("api-secret").value, ...apiAuth() } },
         template_id: template.template_id,
       });
       apiTables = res.tables || [];
@@ -215,6 +282,10 @@ export async function renderConnection(view, ctx, setCleanup) {
   $("api-table").addEventListener("change", (e) => {
     const t = apiTables.find((x) => x.table === e.target.value);
     const cols = t ? t.columns : [];
+    fillSelect("api-order", cols.map((c) => c.column));
+    const guess = cols.find((c) => c.category === "datetime")
+      || cols.find((c) => /^id$|_id$|time|date|ts/i.test(c.column));
+    if (guess) $("api-order").value = guess.column;
     $("api-cols").innerHTML = t ? `
       <div class="hint">Columns exposed by this table — these are the ones you will map next:</div>
       <div class="table-wrap"><table><thead><tr><th>Column</th><th>Type</th><th>Feeds</th></tr></thead><tbody>
@@ -232,7 +303,8 @@ export async function renderConnection(view, ctx, setCleanup) {
     } else if (source === "api") {
       Object.assign(conn, { interface: "database_api", simulate: false, poll_interval_ms: parseInt($("api-poll").value, 10) || 1000,
         database: { mode: "customer", api_url: $("api-url").value.trim(), api_key: $("api-key").value.trim(),
-          api_secret: $("api-secret").value, table: $("api-table").value || null } });
+          api_secret: $("api-secret").value, ...apiAuth(), table: $("api-table").value || null,
+          order_by: $("api-order").value || null } });
     } else if (source === "db") {
       Object.assign(conn, { interface: "database_api", simulate: false, poll_interval_ms: parseInt($("db-poll").value, 10) || 1000,
         database: { ...dbConnection(), table: $("db-table").value || null, order_by: $("db-order").value || null } });
@@ -263,7 +335,7 @@ export async function renderConnection(view, ctx, setCleanup) {
           <div class="hint" id="push-state">${r.connected ? `Last message ${esc(r.last_message_at)}` : "Waiting for the first message…"}</div>`;
       } else if (r.payload) {
         body = `<div class="stat primary"><div class="k">Connection</div><div class="v" style="font-size:18px">CONNECTED</div></div>
-          <div class="field" style="margin-top:12px"><label>Latest record from the source</label>
+          <div class="field" style="margin-top:12px"><label>${r.replay ? "First replay record" : "Latest record from the source"}</label>
           <pre class="code">${esc(JSON.stringify(r.payload, null, 2))}</pre></div>`;
       } else {
         body = `<div class="stat-grid" style="grid-template-columns:1fr 1fr">

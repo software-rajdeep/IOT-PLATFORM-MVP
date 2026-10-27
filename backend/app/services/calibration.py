@@ -28,3 +28,22 @@ def current_displacement(device_id: str):
         "displacement.value_mm": float(row["displacement_value_mm"]) if row["displacement_value_mm"] is not None else None,
         "ts": row["ts"].isoformat() if row.get("ts") else None,
     }
+
+
+def latest_fields(instance_id: str, device_id: str) -> tuple[dict, str | None]:
+    """All mapped sensor fields from the newest measurement for one source."""
+    row = fetch_one(
+        "SELECT fields, ts FROM metrics.measurements "
+        "WHERE instance_id = %s AND device_id = %s ORDER BY ts DESC LIMIT 1",
+        (instance_id, device_id),
+    )
+    if not row:
+        return {}, None
+    fields = row.get("fields") or {}
+    if isinstance(fields, str):
+        import json
+        try:
+            fields = json.loads(fields)
+        except (TypeError, ValueError):
+            fields = {}
+    return fields, row["ts"].isoformat() if row.get("ts") else None

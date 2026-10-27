@@ -1,7 +1,7 @@
 // Service worker: cache the static SPA shell so repeat page loads are instant.
 // API responses are never cached (live data must always be fresh).
 // Bump VERSION whenever the static file list changes to force a clean precache.
-const VERSION = "ucap-v1";
+const VERSION = "ucap-v3";
 const STATIC_CACHE = `ucap-static-${VERSION}`;
 const SHELL_CACHE = `ucap-shell-${VERSION}`;
 
@@ -118,6 +118,25 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (STATIC_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) {
+    // JS changes often during commissioning: prefer the network so a reload
+    // picks up fixes immediately, and fall back to the cached copy offline.
+    if (url.pathname.startsWith("/js/")) {
+      event.respondWith(
+        (async () => {
+          try {
+            const fresh = await fetch(request);
+            if (fresh && fresh.ok) {
+              const cache = await caches.open(STATIC_CACHE);
+              cache.put(request, fresh.clone());
+            }
+            return fresh;
+          } catch {
+            return (await caches.match(request)) || Response.error();
+          }
+        })()
+      );
+      return;
+    }
     event.respondWith(staleWhileRevalidate(event, request));
   }
 });

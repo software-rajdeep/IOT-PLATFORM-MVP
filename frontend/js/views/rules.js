@@ -13,6 +13,8 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
   const [instance, al] = await Promise.all([api.instance(instanceId), api.alerts(instanceId)]);
   const cfg = instance.config || {};
   const inputs = (instance.template.inputs || []).filter((f) => !f.key.startsWith("calibration."));
+  const inputByKey = Object.fromEntries(inputs.map((f) => [f.key, f]));
+  const truthy = (value) => ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
   const rules = al.rules || {};
 
   view.innerHTML = `
@@ -24,8 +26,12 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
       <div class="two-col">
         <div class="panel">
           <h3>Limits</h3>
-          ${inputs.map((f) => `<div class="field"><label>${esc(f.label)}${f.unit ? ` (${esc(f.unit)})` : ""}</label>
-            <input data-key="${esc(f.key)}" type="number" step="any" value="${esc(cfg[f.key] ?? "")}" /></div>`).join("")}
+          ${inputs.map((f) => f.type === "boolean"
+            ? `<label class="setting-row"><span>${esc(f.label)}</span>
+                <input data-key="${esc(f.key)}" type="checkbox" ${truthy(cfg[f.key]) ? "checked" : ""} /></label>`
+            : `<div class="field"><label>${esc(f.label)}${f.unit ? ` (${esc(f.unit)})` : ""}</label>
+                <input data-key="${esc(f.key)}" type="${f.type === "text" ? "text" : "number"}" step="any"
+                  value="${esc(cfg[f.key] ?? "")}" /></div>`).join("")}
           <button class="btn secondary btn-sm" id="lsave">Save limits</button>
         </div>
         <div class="panel">
@@ -46,10 +52,21 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
 
   async function saveLimits(quiet) {
     const config = {};
-    view.querySelectorAll("[data-key]").forEach((el) => { config[el.dataset.key] = el.value === "" ? null : Number(el.value); });
-    const lo = Object.entries(config).find(([k]) => /lower/.test(k));
-    const hi = Object.entries(config).find(([k]) => /upper/.test(k) && !/warning/.test(k));
-    if (lo && hi && lo[1] != null && hi[1] != null && lo[1] >= hi[1]) { toast("Lower limit must be below the upper limit"); return false; }
+    view.querySelectorAll("[data-key]").forEach((el) => {
+      const spec = inputByKey[el.dataset.key] || {};
+      if (spec.type === "boolean") config[el.dataset.key] = el.checked;
+      else if (spec.type === "text") config[el.dataset.key] = el.value === "" ? null : el.value;
+      else config[el.dataset.key] = el.value === "" ? null : Number(el.value);
+    });
+    const roles = instance.template.field_roles || {};
+    const pairs = [[roles.lower, roles.upper], ["reference.lower_limit_mm", "reference.upper_limit_mm"]];
+    for (const [loKey, hiKey] of pairs) {
+      if (!loKey || !hiKey) continue;
+      if (config[loKey] != null && config[hiKey] != null && config[loKey] >= config[hiKey]) {
+        toast("Lower limit must be below the upper limit");
+        return false;
+      }
+    }
     await api.updateInstance(instanceId, { config });
     if (!quiet) toast("Limits saved");
     return true;

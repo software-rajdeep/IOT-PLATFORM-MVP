@@ -1,4 +1,4 @@
-import { api } from "../api.js";
+import { api, liveUpdates } from "../api.js";
 import { esc, toast } from "../ui.js";
 import { mountBoard } from "./board.js";
 import { calibrationPanel } from "./commission.js";
@@ -131,11 +131,18 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
   const handlers = {
     recalibrate: () => {
       show("cal-modal");
-      stopCal = calibrationPanel($("cal-host"), instanceId, activeDevice, () => refresh());
+      stopCal = calibrationPanel($("cal-host"), instanceId, activeDevice, () => refresh(),
+        { mode: (instance.template.commissioning || {}).calibration });
+    },
+    "reset-calibration": async () => {
+      try { await api.resetCalibration(instanceId); toast("Calibration reset"); refresh(); }
+      catch (err) { toast(err.message); }
     },
     "save-limits": async (btn) => {
       const config = {};
-      btn.closest(".w-body").querySelectorAll("[data-limit]").forEach((el) => { config[el.dataset.limit] = el.value === "" ? null : Number(el.value); });
+      const body = btn.closest(".w-body");
+      body.querySelectorAll("[data-limit]").forEach((el) => { config[el.dataset.limit] = el.value === "" ? null : Number(el.value); });
+      body.querySelectorAll("[data-limit-flag]").forEach((el) => { config[el.dataset.limitFlag] = el.checked; });
       try { await api.updateInstance(instanceId, { config }); toast("Limits saved"); board.redraw("limits_editor"); refresh(); }
       catch (err) { toast(err.message); }
     },
@@ -307,10 +314,15 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
       scheduleFallback();
     }, 5000);
   };
-  const stopLive = api.liveUpdates(instanceId, () => {
-    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
-    scheduleRefresh();
-  }, scheduleFallback);
+  let stopLive = () => {};
+  try {
+    stopLive = liveUpdates(instanceId, () => {
+      if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+      scheduleRefresh();
+    }, scheduleFallback);
+  } catch {
+    // The 5-second fallback below still keeps the dashboard fresh.
+  }
   scheduleFallback();
   setCleanup(() => {
     disposed = true;

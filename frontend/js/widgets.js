@@ -76,7 +76,7 @@ function histogram(points, lower, upper, target, h = 200) {
     const hh = (c / maxC) * (h - 6);
     const centre = lo + ((i + 0.5) / bins) * span;
     const ok = (lower == null || centre >= lower) && (upper == null || centre <= upper);
-    return `<rect x="${(i * bw + 1).toFixed(1)}" y="${(h - hh).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${hh.toFixed(1)}" fill="${ok ? "rgba(22,199,154,.75)" : "rgba(255,93,93,.8)"}" rx="1"/>`;
+    return `<rect x="${(i * bw + 1).toFixed(1)}" y="${(h - hh).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${hh.toFixed(1)}" fill="${ok ? "rgba(74,122,94,.75)" : "rgba(220,50,50,.8)"}" rx="1"/>`;
   }).join("");
   const vx = (v) => (((v - lo) / span) * W).toFixed(1);
   const marks = [[lower, "var(--bad)"], [upper, "var(--bad)"], [target, "var(--muted)"]].filter(([v]) => v != null)
@@ -91,7 +91,7 @@ function bars(points, lower, upper, target, h = 200) {
   const Y = (v) => h - ((v - min) / (max - min)) * h;
   const bw = W / pts.length;
   const rects = pts.map((p, i) => `<rect x="${(i * bw + 0.5).toFixed(1)}" y="${Y(p.value).toFixed(1)}" width="${(bw - 1.5).toFixed(1)}"
-    height="${(h - Y(p.value)).toFixed(1)}" fill="${p.status === "FAIL" ? "rgba(255,93,93,.85)" : "rgba(22,199,154,.8)"}" rx="1"/>`).join("");
+    height="${(h - Y(p.value)).toFixed(1)}" fill="${p.status === "FAIL" ? "rgba(220,50,50,.85)" : "rgba(74,122,94,.8)"}" rx="1"/>`).join("");
   const refs = [[lower, "var(--bad)"], [upper, "var(--bad)"], [target, "var(--muted)"]].filter(([v]) => v != null).map(([v, c]) => hline(Y(v), c, h)).join("");
   return svg(h, refs + rects);
 }
@@ -110,7 +110,7 @@ function scatter(points, lower, upper, h = 200) {
 
 function donut(pct) {
   const r = 30, c = 2 * Math.PI * r, v = pct == null ? 0 : pct / 100;
-  return `<svg viewBox="0 0 80 80" class="donut"><circle cx="40" cy="40" r="${r}" fill="none" stroke="#33141a" stroke-width="10"/>
+  return `<svg viewBox="0 0 80 80" class="donut"><circle cx="40" cy="40" r="${r}" fill="none" stroke="#f0f2f6" stroke-width="10"/>
     <circle cx="40" cy="40" r="${r}" fill="none" stroke="var(--good)" stroke-width="10" stroke-dasharray="${(c * v).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 40 40)"/>
     <text x="40" y="45" text-anchor="middle" font-size="15" fill="var(--text)" font-family="var(--mono)">${pct == null ? "—" : Math.round(pct) + "%"}</text></svg>`;
 }
@@ -171,16 +171,43 @@ export function renderWidget(type, d, state = {}) {
     }
     case "calibration_status": {
       const done = !!cfg["calibration.calibrated_at"];
+      const baselines = cfg["calibration.baselines"] || {};
+      const gap = cfg["calibration.gap_distance"];
+      const isGap = cfg["calibration.mode"] === "gap" || cfg["calibration.mode"] === "auto_gap" || gap != null;
+      const isBaseline = !isGap && (cfg["calibration.mode"] === "baseline" || Object.keys(baselines).length > 0);
+      const detail = isGap
+        ? `gap ${fmt(gap)} ${u}${cfg["calibration.object_thickness"] != null
+          ? ` · object ${fmt(cfg["calibration.object_thickness"])} ${u}` : ""}${cfg["calibration.tolerance_mm"] != null
+          ? ` · ±${fmt(cfg["calibration.tolerance_mm"])} ${u}` : ""}`
+        : isBaseline
+        ? `baseline on ${Object.keys(baselines).length || 0} sensor(s) · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
+        : `${d.label.toLowerCase()} = ${fmt(cfg["calibration.scale"], 4)} × input + ${fmt(cfg["calibration.offset"], 4)}`;
       return `<div class="cal-status-row"><span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : "not calibrated"}</span>
-        <button class="btn btn-sm" data-act="recalibrate">${done ? "Recalibrate" : "Calibrate"}</button></div>
-        <div class="stat-sub">${d.label.toLowerCase()} = ${fmt(cfg["calibration.scale"], 4)} × input + ${fmt(cfg["calibration.offset"], 4)}
+        <button class="btn btn-sm" data-act="recalibrate">${done ? "Recalibrate" : "Calibrate"}</button>
+        ${done ? `<button class="btn secondary btn-sm" data-act="reset-calibration">Reset</button>` : ""}</div>
+        <div class="stat-sub">${esc(detail)}
         ${done ? `<br/>by ${esc(cfg["calibration.calibrated_by"] || "")} · ${esc(new Date(cfg["calibration.calibrated_at"]).toLocaleString())}` : ""}</div>`;
     }
-    case "limits_editor":
+    case "limits_editor": {
+      const keys = cfg.keys || {};
+      const fields = [
+        ["target", keys.target, cfg.target],
+        ["lower", keys.lower, cfg.lower],
+        ["upper", keys.upper, cfg.upper],
+        ["reference lower", keys.reference_lower, cfg.reference_lower],
+        ["reference upper", keys.reference_upper, cfg.reference_upper],
+      ].filter(([, key]) => key);
       return `<div class="limits-row">
-        ${["target", "lower", "upper"].filter((k) => cfg.keys && cfg.keys[k]).map((k) => `<label><span class="limit-label">${k} ${u}</span>
-          <input class="limit-input" data-limit="${esc(cfg.keys[k])}" type="number" step="any" value="${cfg[k] ?? ""}"/></label>`).join("")}
-        <button class="btn btn-sm" data-act="save-limits">Save</button></div>`;
+        ${fields.map(([label, key, value]) => `<label><span class="limit-label">${esc(label)} ${u}</span>
+          <input class="limit-input" data-limit="${esc(key)}" type="number" step="any" value="${value ?? ""}"/></label>`).join("")}
+        ${(keys.lower || keys.upper) ? `<label class="limit-check"><input type="checkbox" data-limit-flag="${esc(keys.limit_active || "thickness.limit_active")}"
+          ${cfg.limit_active ? "checked" : ""}/><span>value limit</span></label>` : ""}
+        ${keys.reference_lower ? `<label class="limit-check"><input type="checkbox" data-limit-flag="reference.limit_active"
+          ${cfg["reference.limit_active"] ? "checked" : ""}/><span>reference limit</span></label>` : ""}
+        <button class="btn btn-sm" data-act="save-limits">Save</button></div>
+        ${keys.reference_lower && !cfg["reference.limit_active"]
+          ? `<div class="stat-sub">Reference error is shown but its limit is disabled.</div>` : ""}`;
+    }
     case "alerts_list":
       return (d.alerts || []).length ? `<ul class="walerts">${d.alerts.map((a) => `<li class="${a.resolved_at ? "resolved" : ""}">
         <span class="badge ${a.severity === "critical" ? "bad" : "warn"}">${esc(a.rule_type.replace("_", " "))}</span>
@@ -198,8 +225,16 @@ export function renderWidget(type, d, state = {}) {
     }
     case "sensor_list": {
       const list = d.sensors || [];
-      return list.length ? `<table class="wtable"><thead><tr><th>Sensor</th><th class="td-r">Reading ${u}</th></tr></thead><tbody>
-        ${list.map((s) => `<tr><td>${esc(s.label || s.key)}</td><td class="td-r td-mono">${fmt(s.value)}</td></tr>`).join("")}
+      const computed = list.some((s) => s.thickness != null || s.error != null);
+      const withDistance = list.some((s) => s.distance != null);
+      return list.length ? `<table class="wtable"><thead><tr><th>Sensor</th><th class="td-r">${withDistance ? "Distance" : "Raw"} ${u}</th>
+        ${computed ? `<th class="td-r">Thickness / error ${u}</th>` : ""}</tr></thead><tbody>
+        ${list.map((s) => {
+          const value = s.is_reference ? s.error : s.thickness;
+          const shown = withDistance && s.distance != null ? s.distance : s.value;
+          return `<tr><td>${esc(s.label || s.key)}</td><td class="td-r td-mono">${fmt(shown)}</td>
+            ${computed ? `<td class="td-r td-mono ${s.status === "FAIL" ? "bad" : ""}">${fmt(value)}</td>` : ""}</tr>`;
+        }).join("")}
         </tbody></table>` : `<div class="empty">one sensor — add more in Setup › Map</div>`;
     }
     case "raw_readings": {
@@ -217,11 +252,16 @@ export function renderWidget(type, d, state = {}) {
     case "raw_current": {
       const list = d.sensors || [];
       return list.length
-        ? `<div class="raw-current-grid">${list.map((sensor) => `
-            <div class="raw-current-item">
+        ? `<div class="raw-current-grid">${list.map((sensor) => {
+            const extra = sensor.is_reference
+              ? (sensor.error == null ? "" : `<div class="stat-sub">error ${fmt(sensor.error)} ${u}</div>`)
+              : (sensor.thickness == null ? "" : `<div class="stat-sub">thickness ${fmt(sensor.thickness)} ${u}</div>`);
+            const shown = sensor.distance != null ? sensor.distance : sensor.value;
+            return `<div class="raw-current-item">
               <div class="stat-sub">${esc(sensor.label || sensor.key)}</div>
-              <div class="big">${fmt(sensor.value)}<span class="u">${u}</span></div>
-            </div>`).join("")}</div>`
+              <div class="big">${fmt(shown)}<span class="u">${u}</span></div>${extra}
+            </div>`;
+          }).join("")}</div>`
         : `<div class="empty">waiting for raw readings…</div>`;
     }
     default:

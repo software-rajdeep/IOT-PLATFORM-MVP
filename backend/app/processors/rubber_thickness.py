@@ -14,15 +14,7 @@ customer's calibration (BLOCK 5).
 from __future__ import annotations
 
 from .registry import register
-
-
-def _num(value, default=None):
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+from ..services.limits import bounds, number as _num, status
 
 
 @register("rubber_thickness")
@@ -31,8 +23,8 @@ def rubber_thickness(config: dict, fields: dict) -> dict:
     scale = _num(config.get("calibration.scale"), -1.0)
     offset = _num(config.get("calibration.offset"), 0.0)
     target = _num(config.get("thickness.target_mm"))
-    lower = _num(config.get("thickness.lower_limit_mm"))
-    upper = _num(config.get("thickness.upper_limit_mm"))
+    lower, upper, active = bounds(
+        config, "thickness.limit_active", "thickness.lower_limit_mm", "thickness.upper_limit_mm")
 
     result = {
         "thickness.actual_mm": None,
@@ -46,6 +38,5 @@ def rubber_thickness(config: dict, fields: dict) -> dict:
     result["thickness.actual_mm"] = actual
     if target is not None:
         result["thickness.deviation_mm"] = round(actual - target, 6)
-    if lower is not None and upper is not None:
-        result["quality.status"] = "PASS" if (lower <= actual <= upper) else "FAIL"
+    result["quality.status"] = status(actual, lower, upper, active)
     return result

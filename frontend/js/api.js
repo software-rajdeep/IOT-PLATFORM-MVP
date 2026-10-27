@@ -94,6 +94,10 @@ export const api = {
   createInstance: (data) => request("/instances", { method: "POST", body: data }),
   updateInstance: (id, data) => request(`/instances/${id}`, { method: "PATCH", body: data }),
   calibrate: (id, data) => request(`/instances/${id}/calibrate`, { method: "POST", body: data }),
+  calibrateBaseline: (id, data) => request(`/instances/${id}/calibrate/baseline`, { method: "POST", body: data }),
+  calibrateOpposite: (id, data) => request(`/instances/${id}/calibrate/opposite`, { method: "POST", body: data }),
+  calibrationLive: (id) => request(`/instances/${id}/calibration/live`),
+  resetCalibration: (id) => request(`/instances/${id}/calibration/reset`, { method: "POST" }),
   verifyCalibration: (id, data) => request(`/instances/${id}/calibration/verify`, { method: "POST", body: data }),
   activate: (id) => request(`/instances/${id}/activate`, { method: "POST" }),
   instanceDevices: (id) => request(`/instances/${id}/devices`),
@@ -101,6 +105,7 @@ export const api = {
     request(`/instances/${id}/devices`, { method: "POST", body: { device_id: deviceId } }),
 
   // dashboard (BLOCK 6)
+  liveUpdates,
   dashboard: (id, deviceId) =>
     request(`/instances/${id}/dashboard` + (deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "")),
   measurements: (id, limit = 100) => request(`/instances/${id}/measurements?limit=${limit}`),
