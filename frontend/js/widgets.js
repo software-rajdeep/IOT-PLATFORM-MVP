@@ -22,6 +22,7 @@ export const DEFAULT_TITLES = {
   history_table: () => "Reading history",
   sensor_list: () => "Sensor readings",
   raw_readings: () => "Raw readings",
+  raw_current: () => "Current raw sensor readings",
 };
 
 // Widgets that hold user input are drawn once, not on every live refresh.
@@ -212,6 +213,16 @@ export function renderWidget(type, d, state = {}) {
         ${rows.length ? `<table class="wtable"><thead><tr><th>Time</th><th class="td-r">Raw ${u}</th></tr></thead><tbody>
         ${rows.map((r) => `<tr><td class="td-mono td-dim">${esc(shortTime(r.ts))}</td><td class="td-mono td-r">${fmt(r.value)}</td></tr>`).join("")}
         </tbody></table>` : `<div class="empty">waiting for raw readings…</div>`}`;
+    }
+    case "raw_current": {
+      const list = d.sensors || [];
+      return list.length
+        ? `<div class="raw-current-grid">${list.map((sensor) => `
+            <div class="raw-current-item">
+              <div class="stat-sub">${esc(sensor.label || sensor.key)}</div>
+              <div class="big">${fmt(sensor.value)}<span class="u">${u}</span></div>
+            </div>`).join("")}</div>`
+        : `<div class="empty">waiting for raw readings…</div>`;
     }
     default:
       return `<div class="empty">unknown widget ${esc(type)}</div>`;

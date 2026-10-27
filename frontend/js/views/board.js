@@ -52,10 +52,14 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     last = data;
     for (const it of items.values()) {
       const title = it.title || (DEFAULT_TITLES[it.type] ? DEFAULT_TITLES[it.type](data) : it.type);
-      it.el.querySelector(".w-title").textContent = title;
+      const titleEl = it.el.querySelector(".w-title");
+      if (titleEl.textContent !== title) titleEl.textContent = title;
       if (STATIC_WIDGETS.has(it.type) && it.drawn) continue;
-      it.el.querySelector(".w-body").innerHTML = renderWidget(it.type, data, it.state);
+      const html = renderWidget(it.type, data, it.state);
       it.drawn = true;
+      if (html === it.html) continue;
+      it.el.querySelector(".w-body").innerHTML = html;
+      it.html = html;
     }
   }
 

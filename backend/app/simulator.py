@@ -36,8 +36,12 @@ _pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="source")
 _in_flight: set[str] = set()
 _next_due: dict[str, float] = {}
 _last_hash: dict[str, str] = {}
+_last_error: dict[str, Optional[str]] = {}
+_sources_cache: list[dict] = []
+_sources_cache_at = 0.0
 _t0 = time.time()
 MIN_INTERVAL_S = 0.5
+SOURCE_REFRESH_S = 1.0
 
 
 def _as_dict(value) -> dict:
@@ -79,6 +83,9 @@ def _centre_displacement(device_id: str) -> Optional[float]:
 
 
 def _record_error(device_id: str, message: Optional[str]) -> None:
+    if _last_error.get(device_id) == message:
+        return
+    _last_error[device_id] = message
     if message:
         execute("UPDATE core.device_connections SET last_error = %s, last_error_at = now() WHERE device_id = %s",
                 (message[:500], device_id))
@@ -103,6 +110,18 @@ def poll_once(device_id: str) -> None:
             config["simulate_displacement_mm"] = (centre if centre is not None else 1.5) + 0.12 * math.sin(t / 6.0)
             connector = connector_cls(config, {"centre_distance": device.get("centre_distance")})
             payload = {"measurement_raw": connector.readMeasurement().get("measurement_raw")}
+        elif getattr(connector, "replay", False) and hasattr(connector, "read_replay_payload"):
+            result = connector.read_replay_payload(device.get("last_cursor"))
+            if not result:
+                _record_error(device_id, "Replay source has no rows")
+                return
+            payload, next_cursor = result
+            ingest_raw(device_id, payload)
+            if next_cursor is not None:
+                execute("UPDATE core.device_connections SET last_cursor = %s WHERE device_id = %s",
+                        (next_cursor, device_id))
+            _record_error(device_id, None)
+            return
         elif hasattr(connector, "read_payload"):
             payload = connector.read_payload()
             if not payload:
@@ -138,11 +157,15 @@ def _run(device_id: str) -> None:
 
 
 def _loop() -> None:
+    global _sources_cache_at
     last_offline_check = 0.0
     while not _stop.is_set():
         now = time.monotonic()
         try:
-            for src in _active_sources():
+            if now - _sources_cache_at >= SOURCE_REFRESH_S:
+                _sources_cache[:] = _active_sources()
+                _sources_cache_at = now
+            for src in _sources_cache:
                 params = _as_dict(src.get("connection_parameters"))
                 simulated = params.get("simulate", True)
                 if simulated and not settings.enable_simulator:

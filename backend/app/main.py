@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
 from .routers import auth, catalog, demo_customer, devices, gateway, instance_setup, instances, meta
+from .services.dashboard import invalidate_dashboards
 
 
 @asynccontextmanager
@@ -49,11 +50,22 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def no_cache_static(request, call_next):
-    """Never cache the dependency-free frontend so UI changes appear instantly."""
+async def static_cache_policy(request, call_next):
+    """Revalidate static assets instead of re-downloading them, and drop the
+    dashboard cache whenever anything is written."""
     response = await call_next(request)
-    if request.url.path in ("/", "/index.html") or request.url.path.startswith(("/js/", "/css/")):
-        response.headers["Cache-Control"] = "no-store"
+    path = request.url.path
+
+    if request.method not in ("GET", "HEAD") and path.startswith("/api/"):
+        invalidate_dashboards()
+
+    if path == "/sw.js":
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Service-Worker-Allowed"] = "/"
+    elif path in ("/", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache"
+    elif path.startswith(("/js/", "/css/", "/vendor/")):
+        response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
     return response
 
 for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer):

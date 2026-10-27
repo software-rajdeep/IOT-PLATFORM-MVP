@@ -33,6 +33,40 @@ async function request(path, { method = "GET", body, raw = false } = {}) {
   return data;
 }
 
+export function liveUpdates(id, onMeasurement, onDisconnect) {
+  const controller = new AbortController();
+  const token = store.token();
+  let buffer = "";
+
+  (async () => {
+    try {
+      const res = await fetch(`${BASE}/instances/${encodeURIComponent(id)}/live`, {
+        headers: token ? { Authorization: "Bearer " + token } : {},
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`Live stream failed (${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        buffer += decoder.decode(part.value, { stream: true });
+        const messages = buffer.split("\n\n");
+        buffer = messages.pop() || "";
+        for (const message of messages) {
+          const line = message.split("\n").find((item) => item.startsWith("data:"));
+          if (line) onMeasurement(JSON.parse(line.slice(5).trim()));
+        }
+      }
+      if (!controller.signal.aborted && onDisconnect) onDisconnect();
+    } catch (err) {
+      if (!controller.signal.aborted && onDisconnect) onDisconnect(err);
+    }
+  })();
+
+  return () => controller.abort();
+}
+
 export const api = {
   login: (email, password) => request("/auth/login", { method: "POST", body: { email, password } }),
   me: () => request("/auth/me"),

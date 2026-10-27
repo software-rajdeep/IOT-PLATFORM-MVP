@@ -1,5 +1,6 @@
-# thickness-monitoring is a separate project with its own repository.
+# separate projects with their own repositories
 thickness-monitoring/
+/IoT Platform/
 
 # secrets & local env
 .env

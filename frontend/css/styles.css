@@ -559,6 +559,9 @@ h2 { font-size: 18px; margin: 0 0 4px; }
 .raw-select select { background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 3px 6px; font-size: 12px; font-family: var(--mono); max-width: 180px; }
 .raw-select select:focus { border-color: var(--accent); }
+.raw-current-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+.raw-current-item { min-width: 0; }
+.raw-current-item .big { margin-top: 6px; }
 .td-r { text-align: right !important; }
 .td-mono { font-family: var(--mono); }
 .td-dim { color: var(--muted); }

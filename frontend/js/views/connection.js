@@ -77,6 +77,13 @@ export async function renderConnection(view, ctx, setCleanup) {
                 <div class="field"><label>Username</label><input id="db-user" /></div>
               </div>
               <div class="field"><label>Password</label><input id="db-pass" type="password" /></div>
+              <div class="field"><label>SSL mode</label><select id="db-sslmode">
+                <option value="">Default (prefer)</option>
+                <option value="require">require</option>
+                <option value="verify-ca">verify-ca</option>
+                <option value="verify-full">verify-full</option>
+                <option value="disable">disable</option>
+              </select><div class="hint">Managed Postgres (e.g. Neon) needs <b>require</b>.</div></div>
               <button class="btn secondary btn-sm" id="db-discover" type="button">Discover tables</button>
               <div id="discover-result" class="hint" style="margin:8px 0"></div>
               <div id="db-table-wrap" class="hidden">
@@ -141,7 +148,7 @@ export async function renderConnection(view, ctx, setCleanup) {
     return {
       mode: "internal", host: $("db-host").value.trim() || null, port: parseInt($("db-port").value, 10) || null,
       database: $("db-name").value.trim() || null, username: $("db-user").value.trim() || null,
-      password: $("db-pass").value || null,
+      password: $("db-pass").value || null, sslmode: $("db-sslmode").value || null,
     };
   }
 

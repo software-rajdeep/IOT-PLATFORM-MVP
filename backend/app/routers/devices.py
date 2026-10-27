@@ -48,6 +48,7 @@ class DatabaseApiIn(BaseModel):
     order_by: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
+    sslmode: Optional[str] = None  # e.g. "require" for managed Postgres (Neon, RDS, etc.)
     column: Optional[str] = None  # legacy single-field mapping
 
     # customer mode (their API)

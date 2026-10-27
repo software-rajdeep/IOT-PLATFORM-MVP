@@ -36,9 +36,11 @@ from __future__ import annotations
 import json
 import math
 import random
+import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -52,6 +54,8 @@ MAX_RESPONSE_BYTES = 1_000_000
 TARGET_FIELDS = ("measurement_raw", "timestamp", "device_id")
 
 DEFAULT_RAW_COLUMN = "measurement_raw"
+_connection_pools = {}
+_connection_pools_lock = threading.Lock()
 
 
 def _lookup(data: Any, path: str):
@@ -116,6 +120,8 @@ class DatabaseApiConnector(DeviceDriver):
         self.order_by = db.get("order_by") or self.config.get("order_by")
         self.username = db.get("username") or db.get("user") or self.config.get("username")
         self.password = db.get("password") or self.config.get("password")
+        # sslmode (e.g. "require" for managed Postgres such as Neon). None = libpq default.
+        self.sslmode = db.get("sslmode") or self.config.get("sslmode")
 
         # customer mode (their server, API key + secret)
         self.api_url = db.get("api_url") or self.config.get("api_url")
@@ -132,6 +138,23 @@ class DatabaseApiConnector(DeviceDriver):
                 self.mapping["measurement_raw"] = legacy
         if "timestamp" not in self.mapping and db.get("order_by"):
             self.mapping.setdefault("timestamp", db.get("order_by"))
+
+        # Replay mode: walk through historical rows instead of always reading the
+        # newest one. Used when the real sensor is offline but old readings exist.
+        #   "replay": {"enabled": true, "from": "...", "to": "...",
+        #              "step": 20, "loop": true, "timestamp": "now"}
+        replay = db.get("replay") or self.config.get("replay") or {}
+        if isinstance(replay, bool):
+            replay = {"enabled": replay}
+        self.replay = bool(replay.get("enabled", False))
+        self.replay_from = replay.get("from") or replay.get("start")
+        self.replay_to = replay.get("to") or replay.get("end")
+        self.replay_step = max(1, int(replay.get("step") or 1))
+        self.replay_loop = bool(replay.get("loop", True))
+        self.replay_timestamp = str(replay.get("timestamp") or "now").lower()
+        self.replay_time_column = replay.get("time_column")
+        self.replay_order_by = replay.get("order_by") or self.order_by
+        self._time_column_cache = None
 
         self.timeout = float(self.config.get("timeout", 5))
         self.simulate = bool(self.config.get("simulate", not self._configured()))
@@ -152,6 +175,7 @@ class DatabaseApiConnector(DeviceDriver):
     def _connect(self):
         try:
             import psycopg2
+            from psycopg2.pool import ThreadedConnectionPool
         except ImportError as exc:  # pragma: no cover
             raise DriverError("psycopg2 is required for an internal database connection.") from exc
         from ..services.source_guard import SourceBlocked, check_host
@@ -159,14 +183,45 @@ class DatabaseApiConnector(DeviceDriver):
             check_host(self.host, self.port, self.database)
         except SourceBlocked as exc:
             raise DriverError(str(exc)) from exc
-        return psycopg2.connect(
-            host=self.host,
-            port=self.port,
-            dbname=self.database,
-            user=self.username,
-            password=self.password,
-            connect_timeout=int(self.timeout),
-        )
+        kwargs = {
+            "host": self.host,
+            "port": self.port,
+            "dbname": self.database,
+            "user": self.username,
+            "password": self.password,
+            "connect_timeout": max(1, math.ceil(self.timeout)),
+        }
+        if self.sslmode:
+            kwargs["sslmode"] = self.sslmode
+        key = tuple(sorted(kwargs.items()))
+        with _connection_pools_lock:
+            pool = _connection_pools.get(key)
+            if pool is None:
+                pool = ThreadedConnectionPool(minconn=1, maxconn=4, **kwargs)
+                _connection_pools[key] = pool
+        return pool, pool.getconn()
+
+    @staticmethod
+    def _release(connection_info, broken: bool = False) -> None:
+        pool, conn = connection_info
+        pool.putconn(conn, close=broken)
+
+    @contextmanager
+    def _database_connection(self):
+        connection_info = self._connect()
+        broken = False
+        try:
+            yield connection_info[1]
+        except Exception:
+            broken = True
+            raise
+        finally:
+            if not broken:
+                try:
+                    connection_info[1].rollback()
+                except Exception:
+                    broken = True
+            self._release(connection_info, broken=broken)
 
     def _read_internal(self) -> dict:
         if not self.host or not self.database or not self.table:
@@ -182,14 +237,11 @@ class DatabaseApiConnector(DeviceDriver):
         order_clause = f" ORDER BY {quote_ident(order_col)} DESC" if order_col else ""
         sql = f"SELECT {select_list} FROM {quote_ident(self.table)}{order_clause} LIMIT 1"
 
-        conn = self._connect()
-        try:
+        with self._database_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql)
                 row = cur.fetchone()
                 columns = [d[0] for d in cur.description] if cur.description else []
-        finally:
-            conn.close()
         if not row:
             return {"measurement_raw": None}
         data = dict(zip(columns, row))
@@ -281,8 +333,7 @@ class DatabaseApiConnector(DeviceDriver):
         return self._discover_customer() if self.mode == "customer" else self._discover_internal()
 
     def _discover_internal(self) -> dict:
-        conn = self._connect()
-        try:
+        with self._database_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -293,8 +344,6 @@ class DatabaseApiConnector(DeviceDriver):
                     """
                 )
                 rows = cur.fetchall()
-        finally:
-            conn.close()
         tables: dict = {}
         for schema, table, column, dtype in rows:
             key = f"{schema}.{table}"
@@ -321,17 +370,132 @@ class DatabaseApiConnector(DeviceDriver):
             raise DriverError("Database source requires host, database and table.")
         order_col = self.order_by or self.mapping.get("timestamp")
         order_clause = f" ORDER BY {quote_ident(order_col)} DESC" if order_col else ""
-        conn = self._connect()
-        try:
+        with self._database_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT * FROM {quote_ident(self.table)}{order_clause} LIMIT 1")
                 row = cur.fetchone()
                 columns = [d[0] for d in cur.description] if cur.description else []
-        finally:
-            conn.close()
         if not row:
             return None
         return {col: _json_safe(val) for col, val in zip(columns, row)}
+
+    # -- replay: walk through historical rows ------------------------------
+    def _table_parts(self) -> tuple[str, str]:
+        schema, table = "public", self.table or ""
+        if "." in table:
+            schema, table = table.split(".", 1)
+        return schema, table
+
+    def _replay_time_column(self) -> Optional[str]:
+        """Configured time column, or the first timestamp-like column in the table."""
+        if self.replay_time_column:
+            return self.replay_time_column
+        if self._time_column_cache is not None:
+            return self._time_column_cache
+        schema, table = self._table_parts()
+        with self._database_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s "
+                    "AND data_type IN ('timestamp with time zone', 'timestamp without time zone', 'date') "
+                    "ORDER BY ordinal_position LIMIT 1",
+                    (schema, table),
+                )
+                row = cur.fetchone()
+        self._time_column_cache = row[0] if row else None
+        return self._time_column_cache
+
+    def _replay_order_column(self) -> Optional[str]:
+        return self.replay_order_by or self._replay_time_column()
+
+    @staticmethod
+    def _cursor_kind(cursor):
+        """Return an int/ISO string cursor, or None when it is not reusable."""
+        if cursor in (None, ""):
+            return None
+        text = str(cursor)
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            pass
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return text
+        except ValueError:
+            return None
+
+    def _replay_row(self, cursor, offset: int = 0) -> Optional[dict]:
+        order_col = self._replay_order_column()
+        if not order_col:
+            raise DriverError("Replay requires an order_by or a timestamp column.")
+        time_col = self._replay_time_column()
+
+        where: list[str] = []
+        params: list = []
+        if time_col:
+            if self.replay_from:
+                where.append(f"{quote_ident(time_col)} >= %s::timestamptz")
+                params.append(str(self.replay_from))
+            if self.replay_to:
+                where.append(f"{quote_ident(time_col)} <= %s::timestamptz")
+                params.append(str(self.replay_to))
+        if cursor is not None:
+            if isinstance(cursor, int):
+                where.append(f"{quote_ident(order_col)} > %s")
+            else:
+                where.append(f"{quote_ident(order_col)} > %s::timestamptz")
+            params.append(cursor)
+
+        sql = f"SELECT * FROM {quote_ident(self.table)}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {quote_ident(order_col)} ASC"
+        if offset:
+            sql += f" OFFSET {int(offset)}"
+        sql += " LIMIT 1"
+
+        with self._database_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                columns = [d[0] for d in cur.description] if cur.description else []
+        if not row:
+            return None
+        return {col: _json_safe(val) for col, val in zip(columns, row)}
+
+    def read_replay_payload(self, cursor: Optional[str] = None) -> Optional[tuple[dict, Optional[str]]]:
+        """Return (next historical row, new cursor), looping when configured.
+
+        The cursor is the value of the order column (id or timestamp) of the row
+        just read. ``step`` jumps several rows per call so a long history can be
+        replayed at a watchable speed.
+        """
+        if not self.replay:
+            return None
+        if not self.host or not self.database or not self.table:
+            raise DriverError("Replay requires host, database and table.")
+
+        normalised = self._cursor_kind(cursor)
+        offset = 0 if normalised is None else self.replay_step - 1
+        row = self._replay_row(normalised, offset)
+        if row is None and self.replay_loop:
+            row = self._replay_row(None, 0)
+        if row is None:
+            return None
+
+        order_col = (self._replay_order_column() or "").split(".")[-1]
+        next_cursor = row.get(order_col)
+        if next_cursor is not None:
+            next_cursor = str(next_cursor)
+
+        # Optionally stamp the row with the current time so the dashboard graph
+        # keeps moving forward while old values are being replayed.
+        time_col = self._replay_time_column()
+        if self.replay_timestamp == "now" and time_col:
+            row[time_col] = datetime.now(timezone.utc).isoformat()
+
+        return row, next_cursor
 
     # -- driver contract ---------------------------------------------------
     def checkConnection(self) -> bool:  # noqa: N802

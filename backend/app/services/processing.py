@@ -25,6 +25,7 @@ from .mapping import map_payload
 from .mappings import active_mapping, device_preset
 from .templates import contract, load_template
 from .units import units
+from . import live_updates
 
 
 def _now() -> datetime:
@@ -124,6 +125,7 @@ def ingest_raw(device_id: str, payload: dict, source_ts=None) -> dict:
         )
         if binding.get("status") == "active":
             alerts.on_measurement(company_id, instance_id, device_id, outputs.get("quality.status"), rule_set)
+        live_updates.publish(instance_id, device_id, ts.isoformat())
         results.append({"instance_id": instance_id, **fields})
 
     return {"device_id": device_id, "raw_message_id": raw_id, "results": results}

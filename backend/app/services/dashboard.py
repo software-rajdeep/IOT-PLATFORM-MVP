@@ -7,10 +7,14 @@ defaulting to the template's dashboard metadata.
 """
 from __future__ import annotations
 
+import copy
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from ..config import settings
 from ..db import fetch_all, fetch_one
 from . import alerts
 from .devices import load_device, serialize_device
@@ -81,8 +85,43 @@ def _health(device: dict) -> dict:
     }
 
 
+# Short-lived response cache. Live pages refresh several times per second across
+# tabs/devices; reusing one assembled bundle avoids repeating the same heavy
+# queries. Entries are dropped as soon as any write request lands (see main.py).
+_CACHE_MAX = 128
+_cache: dict[tuple, tuple[float, dict]] = {}
+_cache_lock = threading.Lock()
+
+
+def invalidate_dashboards() -> None:
+    with _cache_lock:
+        _cache.clear()
+
+
 def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: int = 500,
                     device_id: Optional[str] = None) -> Optional[dict]:
+    ttl = settings.dashboard_cache_ttl
+    if ttl <= 0:
+        return _build_dashboard(instance_id, company_id, window, device_id)
+
+    key = (instance_id, company_id, device_id, window)
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return copy.deepcopy(hit[1])
+
+    data = _build_dashboard(instance_id, company_id, window, device_id)
+    if data is not None:
+        with _cache_lock:
+            if len(_cache) >= _CACHE_MAX:
+                _cache.clear()
+            _cache[key] = (now, copy.deepcopy(data))
+    return data
+
+
+def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window: int = 500,
+                     device_id: Optional[str] = None) -> Optional[dict]:
     instance = get_instance(instance_id, company_id)
     if not instance:
         return None
@@ -179,8 +218,11 @@ def build_dashboard(instance_id: str, company_id: Optional[str] = None, window: 
         (c["key"] for c in (template.get("requires") or []) if c.get("required")), None)
     sensors = []
     if input_key:
-        keys = sorted((k for k in latest_fields if k == input_key or k.startswith(input_key + ".")),
-                      key=lambda k: (k != input_key, k))
+        keys = sorted(
+            (k for k in latest_fields
+             if k == input_key or k.startswith(input_key + ".") or k.startswith(input_key + "_")),
+            key=lambda k: (k != input_key, k),
+        )
         per_key = {k: [] for k in keys}
         for r in series_rows:
             f = _json(r["fields"], {})

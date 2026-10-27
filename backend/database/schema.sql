@@ -283,6 +283,8 @@ CREATE TABLE IF NOT EXISTS metrics.measurements (
 );
 CREATE INDEX IF NOT EXISTS idx_measurements_instance_time ON metrics.measurements(instance_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_measurements_device_time ON metrics.measurements(device_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_measurements_instance_device_time
+    ON metrics.measurements(instance_id, device_id, ts DESC);
 
 -- Raw connector messages, kept from day 1 for reprocessing/debugging.
 CREATE TABLE IF NOT EXISTS metrics.raw_device_messages (

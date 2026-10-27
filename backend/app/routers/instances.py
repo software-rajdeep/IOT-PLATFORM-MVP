@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+from queue import Empty
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..db import execute, fetch_all, fetch_one, get_cursor
@@ -17,6 +19,7 @@ from ..services.instances import get_instance, instance_device_ids, list_instanc
 from ..services import alerts, audit
 from ..services.mappings import ensure_initial_mapping
 from ..services.templates import load_template
+from ..services.live_updates import subscribe
 
 router = APIRouter(prefix="/api/v1/instances", tags=["instances"])
 
@@ -303,6 +306,27 @@ def dashboard(instance_id: str, device_id: Optional[str] = Query(default=None),
     if not data:
         raise HTTPException(status_code=404, detail="Instance not found")
     return data
+
+
+@router.get("/{instance_id}/live")
+def live_updates(instance_id: str, user: dict = Depends(get_current_user)) -> StreamingResponse:
+    _owned(instance_id, user)
+
+    def stream():
+        with subscribe(instance_id) as events:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event = events.get(timeout=15)
+                    yield f"event: measurement\ndata: {event}\n\n"
+                except Empty:
+                    yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/{instance_id}/measurements")

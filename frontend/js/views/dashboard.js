@@ -3,6 +3,44 @@ import { esc, toast } from "../ui.js";
 import { mountBoard } from "./board.js";
 import { calibrationPanel } from "./commission.js";
 
+// Last dashboard bundle per instance+device, kept in sessionStorage so a reload
+// or a return to the page paints immediately while fresh data is fetched.
+const CACHE_PREFIX = "ucap_dash:";
+const MAX_CACHE_ENTRIES = 8;
+
+const cacheKey = (instanceId, deviceId) => `${CACHE_PREFIX}${instanceId}:${deviceId || "default"}`;
+
+function readDashboardCache(instanceId, deviceId) {
+  if (!deviceId) return null;
+  try {
+    const raw = sessionStorage.getItem(cacheKey(instanceId, deviceId));
+    const entry = raw ? JSON.parse(raw) : null;
+    const data = entry && entry.data;
+    return data && data.layout && Array.isArray(data.layout.widgets) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function pruneDashboardCache() {
+  const keys = [];
+  for (let i = 0; i < sessionStorage.length; i++) {
+    const key = sessionStorage.key(i);
+    if (key && key.startsWith(CACHE_PREFIX)) keys.push(key);
+  }
+  while (keys.length > MAX_CACHE_ENTRIES) sessionStorage.removeItem(keys.shift());
+}
+
+function writeDashboardCache(instanceId, deviceId, data) {
+  if (!deviceId || !data) return;
+  try {
+    sessionStorage.setItem(cacheKey(instanceId, deviceId), JSON.stringify({ t: Date.now(), data }));
+    pruneDashboardCache();
+  } catch {
+    /* quota exceeded — skip caching */
+  }
+}
+
 // BLOCK 6 dashboard (Live Run Mode). The widget layout is per instance (saved from the
 // graph-options editor, default from the template); every widget renders from the generic
 // dashboard bundle. Device switcher lets a company with several sensors flip between them.
@@ -13,6 +51,7 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
 
   const DEVICE_KEY = "ucap_device_" + instanceId;
   let activeDevice = sessionStorage.getItem(DEVICE_KEY) || instance.device_id || "";
+  const cached = readDashboardCache(instanceId, activeDevice);
   let devices = [];
   let board = null;
   let layoutKey = "";
@@ -163,7 +202,10 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
       + `<button type="button" class="device-item action" id="menu-add">+ Add device</button>
          <button type="button" class="device-item action" id="menu-config">Configure</button>`;
     menu.querySelectorAll(".device-item[data-id]").forEach((el) => el.addEventListener("click", () => {
-      activeDevice = el.dataset.id; sessionStorage.setItem(DEVICE_KEY, activeDevice); menu.classList.remove("open"); refresh();
+      activeDevice = el.dataset.id; sessionStorage.setItem(DEVICE_KEY, activeDevice); menu.classList.remove("open");
+      const snapshot = readDashboardCache(instanceId, activeDevice);
+      if (snapshot) render(snapshot);
+      refresh();
     }));
     $("menu-add").addEventListener("click", openAdd);
     $("menu-config").addEventListener("click", () => {
@@ -189,7 +231,10 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
     } catch (err) { list.innerHTML = `<div class="error-box">${esc(err.message)}</div>`; }
   }
 
+  let lastData = null;
+  let lastCacheWrite = 0;
   function render(data) {
+    lastData = data;
     const key = JSON.stringify(data.layout.widgets.map((w) => [w.id, w.type, w.x, w.y, w.w, w.h]));
     if (!board || key !== layoutKey) {
       if (board) board.destroy();
@@ -201,6 +246,11 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
     devices = data.devices || [];
     activeDevice = data.active_device || activeDevice;
     sessionStorage.setItem(DEVICE_KEY, activeDevice);
+    const now = Date.now();
+    if (now - lastCacheWrite > 3000) {
+      lastCacheWrite = now;
+      writeDashboardCache(instanceId, activeDevice, data);
+    }
     const sel = devices.find((d) => d.device_id === activeDevice);
     $("device-name").textContent = sel ? sel.name : activeDevice;
     $("device-dot").className = `s-dot ${sel && sel.online ? "on" : "off"}`;
@@ -219,22 +269,55 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
 
   let disposed = false;
   let refreshing = false;
+  let pending = false;
+  let lastRefreshAt = 0;
+  let refreshTimer = null;
+  let fallbackTimer = null;
+
   async function refresh() {
-    if (disposed || refreshing) return;
+    if (disposed) return;
+    if (refreshing) { pending = true; return; }
     refreshing = true;
     try {
       const data = await api.dashboard(instanceId, activeDevice || undefined);
       if (!disposed) render(data);
     } catch (err) {
       if (!disposed && !board) $("board").innerHTML = `<div class="error-box">${esc(err.message)}</div>`;
-    } finally { refreshing = false; }
+    } finally {
+      refreshing = false;
+      lastRefreshAt = Date.now();
+      if (pending) { pending = false; scheduleRefresh(); }
+    }
   }
 
+  // Coalesce bursts of live events: one refresh at most every 500 ms.
+  function scheduleRefresh() {
+    if (disposed || refreshTimer) return;
+    const wait = Math.max(0, 500 - (Date.now() - lastRefreshAt));
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, wait);
+  }
+
+  if (cached) render(cached);
   await refresh();
-  const timer = setInterval(refresh, 1000);
+  const scheduleFallback = () => {
+    if (disposed || fallbackTimer) return;
+    fallbackTimer = setTimeout(async () => {
+      fallbackTimer = null;
+      await refresh();
+      scheduleFallback();
+    }, 5000);
+  };
+  const stopLive = api.liveUpdates(instanceId, () => {
+    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+    scheduleRefresh();
+  }, scheduleFallback);
+  scheduleFallback();
   setCleanup(() => {
     disposed = true;
-    clearInterval(timer);
+    if (refreshTimer) clearTimeout(refreshTimer);
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    if (lastData) writeDashboardCache(instanceId, activeDevice, lastData);
+    stopLive();
     document.removeEventListener("click", closeMenu);
     if (stopCal) stopCal();
     if (board) board.destroy();
