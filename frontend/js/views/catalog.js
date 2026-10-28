@@ -25,8 +25,6 @@ export async function renderCatalog(view, ctx) {
     <div class="page">
       ${stepper("solution")}
       <h1>Choose a solution</h1>
-      <p class="lead">Ready-made solutions: a product we support plus an application. Pick one, connect its data,
-        and the dashboard is assembled for you. <a href="#/devices">Browse by device instead →</a></p>
       <div class="searchbar"><input id="q" type="text" placeholder="Filter by product or application…" autocomplete="off" /></div>
       <div id="sol"><div class="spinner">loading catalog…</div></div>
     </div>`;
@@ -50,12 +48,6 @@ export async function renderCatalog(view, ctx) {
         <div class="card-icon">${icon(s.icon)}</div>
         ${s.status !== "available" ? `<span class="num">coming soon</span>` : s.featured ? `<span class="num">featured</span>` : ""}
         <h3>${esc(s.title)}</h3>
-        <div class="sol-pair"><b>${esc(s.model.model_name || "")}</b><span>·</span>${esc(s.template.name || "")}</div>
-        <p>${esc(s.subtitle || "")}</p>
-        ${s.status === "available" ? `<div class="tagrow">
-          ${(s.template.requires || []).map((r) => `<span class="tag accent">needs ${esc(r.kind)}</span>`).join("")}
-          ${(s.template.optional || []).map((r) => `<span class="tag">+ ${esc(r.label || r.key)}</span>`).join("")}
-        </div>` : ""}
       </div>`;
     host.innerHTML = `
       <div class="section-title" style="margin:6px 0 10px">Available now · ${available.length}</div>

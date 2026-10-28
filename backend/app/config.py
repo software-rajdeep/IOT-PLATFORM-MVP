@@ -56,6 +56,16 @@ class Settings:
     # Allow customer sources on private/loopback addresses (dev, LAN gateways).
     allow_private_sources: bool = _bool("ALLOW_PRIVATE_SOURCES", True)
     public_base_url: str = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+    # Gmail OAuth email alerts. Credentials come from the environment; tokens and
+    # per-company settings are written to EMAIL_ALERT_DATA_DIR.
+    email_data_dir: str = os.environ.get("EMAIL_ALERT_DATA_DIR", str(BACKEND_DIR / "data" / "email_alerts"))
+    google_oauth_client_id: str = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+    google_oauth_client_secret: str = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    google_oauth_redirect_uri: str = os.environ.get(
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        + "/api/v1/email-alerts/oauth-callback",
+    )
     # Seconds a built dashboard is reused to coalesce bursts of live refreshes.
     # Set to 0 to disable. Cleared immediately on any write request.
     dashboard_cache_ttl: float = float(os.environ.get("DASHBOARD_CACHE_TTL", "1.0"))

@@ -136,6 +136,12 @@ export const api = {
   alerts: (id) => request(`/instances/${id}/alerts`),
   ackAlert: (id, eventId) => request(`/instances/${id}/alerts/${eventId}/ack`, { method: "POST" }),
   updateAlertRule: (id, type, data) => request(`/instances/${id}/alert-rules/${type}`, { method: "PUT", body: data }),
+
+  // email alerts (Gmail OAuth, company-wide)
+  emailAlertConfig: () => request("/email-alerts/config"),
+  updateEmailAlertConfig: (data) => request("/email-alerts/config", { method: "PUT", body: data }),
+  testEmailAlert: () => request("/email-alerts/test", { method: "POST" }),
+  emailAlertAuthUrl: () => request("/email-alerts/auth-url"),
   report: (id, date) => request(`/instances/${id}/report` + (date ? `?date=${date}` : "")),
   history: (id) => request(`/instances/${id}/history`),
   clone: (id, data) => request(`/instances/${id}/clone`, { method: "POST", body: data }),

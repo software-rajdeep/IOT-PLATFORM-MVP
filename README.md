@@ -80,6 +80,7 @@ Current implementation, validation and the separate Dell/Mac copies: [delivery n
 - Python 3.12+ with: `fastapi`, `uvicorn`, `psycopg2-binary`, `bcrypt`, `itsdangerous`
 - PostgreSQL 14+ (localhost)
 - Optional (real hardware only): `pyserial`
+- Optional (Gmail OAuth email alerts): `google-auth-oauthlib`, `google-api-python-client`
 
 ## Run
 
@@ -104,6 +105,15 @@ API docs: **http://127.0.0.1:8000/docs**
 
 Config is read from `backend/.env` (see `.env.example`). `ENABLE_SIMULATOR=1`
 makes the connector generate readings so the whole platform runs without a CD22.
+
+**Gmail OAuth email alerts.** Create an OAuth 2.0 Client ID (Web application) in
+Google Cloud Console and add the redirect URI shown in the Email alerts panel
+(defaults to `PUBLIC_BASE_URL` + `/api/v1/email-alerts/oauth-callback`; with the
+`run.ps1` default that is `http://127.0.0.1:8000/api/v1/email-alerts/oauth-callback`).
+Then set `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` in `backend/.env`.
+The *Limits & alerts* step of an application shows **Email alerts (Gmail)** for
+company administrators. Settings and tokens are stored per company under
+`backend/data/email_alerts/` (gitignored).
 
 ## Real hardware
 
@@ -136,6 +146,10 @@ curl -X POST http://<server>/api/v1/gateway/measurements \
 | PATCH | `/api/v1/instances/{id}` | set quality limits |
 | POST | `/api/v1/instances/{id}/activate` | activate |
 | GET | `/api/v1/instances/{id}/dashboard` | BLOCK 6 dashboard data |
+| GET/PUT | `/api/v1/email-alerts/config` | company email-alert settings (Gmail OAuth) |
+| POST | `/api/v1/email-alerts/test` | send a test email |
+| GET | `/api/v1/email-alerts/auth-url` | start Google sign-in |
+| GET | `/api/v1/email-alerts/oauth-callback` | Google OAuth callback |
 | POST | `/api/v1/gateway/measurements` | gateway ingest (raw) |
 
 ## Acceptance criteria (V1)
@@ -162,7 +176,8 @@ backend/
     services/processing.py        BLOCK 5 pipeline + rules
     services/dashboard.py         BLOCK 6
     services/{devices,instances,calibration}.py
-    routers/{auth,catalog,devices,instances,gateway,meta}.py
+    services/email_alerts.py      Gmail OAuth delivery (optional)
+    routers/{auth,catalog,devices,instances,gateway,meta,email_alerts}.py
     simulator.py                  runs the real connector in simulation
   database/{schema.sql,seed.sql}
   scripts/init_db.py

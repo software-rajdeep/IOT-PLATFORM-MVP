@@ -23,8 +23,6 @@ export async function renderConnection(view, ctx, setCleanup) {
     <div class="page">
       ${stepper("connect")}
       <h1>Asset & data source</h1>
-      <p class="lead"><b>${esc(model.manufacturer || "")} ${esc(model.model_name)}</b> · ${esc(template.name)}.
-        Where is it installed, and how does its data reach us?</p>
 
       <div class="two-col">
         <div>
@@ -48,15 +46,13 @@ export async function renderConnection(view, ctx, setCleanup) {
                 <div class="field"><label>Gateway ID</label><input id="gateway" value="EDGE001" /></div>
                 <div class="field"><label>RS-485 address</label><input id="address" type="number" value="1" /></div>
               </div>
-              <div class="field"><label>Port</label><input id="port" placeholder="COM3, /dev/ttyUSB0 or 192.168.1.200:8234" />
-                <div class="hint">Serial port on the gateway, or host:port of a serial-to-Ethernet converter.</div></div>
+              <div class="field"><label>Port</label><input id="port" placeholder="COM3, /dev/ttyUSB0 or 192.168.1.200:8234" /></div>
               <div class="field inline"><input type="checkbox" id="simulate" checked /><label for="simulate">Simulate the sensor (no hardware connected)</label></div>
             </div>
 
             <div id="src-api" class="src-fields hidden">
               <div class="field"><label>API URL</label><input id="api-url" placeholder="https://ep-....apirest....neon.tech/<db>/rest/v1" /></div>
               <div class="field"><label>API key</label><input id="api-key" type="password" /></div>
-              <div class="hint">That is all a Neon Data API needs — token refresh is handled automatically.</div>
               <details class="hint" style="margin:6px 0">
                 <summary>Advanced (other APIs)</summary>
                 <div class="field"><label>Secret key (optional)</label><input id="api-secret" type="password" />
@@ -94,7 +90,7 @@ export async function renderConnection(view, ctx, setCleanup) {
                 <option value="verify-ca">verify-ca</option>
                 <option value="verify-full">verify-full</option>
                 <option value="disable">disable</option>
-              </select><div class="hint">Managed Postgres (e.g. Neon) needs <b>require</b>.</div></div>
+              </select></div>
               <button class="btn secondary btn-sm" id="db-discover" type="button">Discover tables</button>
               <div id="discover-result" class="hint" style="margin:8px 0"></div>
               <div id="db-table-wrap" class="hidden">
@@ -132,7 +128,6 @@ export async function renderConnection(view, ctx, setCleanup) {
             </div>
 
             <div id="src-push" class="src-fields hidden">
-              <p class="hint">We create the device and issue a URL + key. Their system posts any JSON; you map it in the next step.</p>
             </div>
 
             <button class="btn" id="create-device" style="margin-top:6px">Create source &amp; test</button>
@@ -155,7 +150,7 @@ export async function renderConnection(view, ctx, setCleanup) {
   let discoverResult = null;
   function invalidateSource() {
     device = null;
-    testPanel.innerHTML = `<h3>Source test</h3><div class="empty">Create and test the updated source before continuing.</div>`;
+    testPanel.innerHTML = `<h3>Source test</h3><div class="empty"></div>`;
     $("create-device").textContent = "Create source & test";
   }
   view.querySelectorAll(".src-fields input, .src-fields select").forEach((el) => {

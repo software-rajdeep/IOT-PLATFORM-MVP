@@ -4,13 +4,12 @@ import { stepper } from "./stepper.js";
 
 // Step 7 — validation gate. Required items must pass before the instance goes live.
 export async function renderActivate(view, ctx, setCleanup, instanceId) {
-  const [check, instance] = await Promise.all([api.checklist(instanceId), api.instance(instanceId)]);
+  const check = await api.checklist(instanceId);
   const link = { mapping: "map", calibration: "commission", limits: "rules", data: "map" };
   view.innerHTML = `
     <div class="page narrow">
       ${stepper("activate", instanceId)}
       <h1>Activate</h1>
-      <p class="lead">${esc(instance.name)} · ${esc(instance.template.name)}</p>
       <div class="panel">
         <h3>Checklist</h3>
         <ul class="checklist">${check.items.map((i) => `<li class="${i.ok ? "ok" : i.required ? "bad" : "warn"}">

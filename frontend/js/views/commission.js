@@ -8,10 +8,9 @@ import { stepper } from "./stepper.js";
 function baselinePanel(host, instanceId, onSaved) {
   host.innerHTML = `
     <div class="live-read"><span class="k">Live sensors</span><span class="v" id="bl-live">—</span></div>
-    <div id="bl-source" class="hint" style="margin:6px 0"></div>
-    <p class="hint" style="margin:8px 0">Put the reference piece (or the production material) under every sensor,
-      enter its actual thickness, then capture the baseline.</p>
-    <div class="table-wrap"><table class="wtable"><thead><tr><th>Sensor</th><th class="td-r">Live</th>
+        <div id="bl-source" class="hint" style="margin:6px 0"></div>
+    <div class="table-wrap">
+<table class="wtable"><thead><tr><th>Sensor</th><th class="td-r">Live</th>
       <th class="td-r">Baseline</th></tr></thead><tbody id="bl-sensors"></tbody></table></div>
     <div class="cal-read-row" style="margin-top:12px">
       <input id="bl-t" class="limit-input" type="number" step="any" placeholder="reference thickness mm" />
@@ -39,7 +38,7 @@ function baselinePanel(host, instanceId, onSaved) {
     $("bl-live").textContent = data.sensors && data.sensors.length ? `${data.sensors.length} sensor(s)` : "no data";
     $("bl-source").textContent = data.source_mode === "replay"
       ? "Old readings are being replayed from the customer database (no live sensor connected)."
-      : data.source_mode === "simulated" ? "Using the built-in simulator." : "";
+      : "";
     const ref = data.reference_sensor_key ? ` · reference ${data.reference_sensor_key}` : "";
     $("bl-result").innerHTML = data.calibrated_at
       ? `<span class="badge good">calibrated</span> reference ${esc(data.reference_thickness ?? "—")} mm${esc(ref)}
@@ -340,12 +339,6 @@ export async function renderCommission(view, ctx, setCleanup, instanceId) {
     <div class="page">
       ${stepper("commission", instanceId)}
       <h1>Commission</h1>
-      <p class="lead">${isGap
-        ? "Enter the gap between the two sensor faces, or use auto-gap with a known object thickness and tolerance."
-        : calibrationMode === "baseline"
-        ? "Capture a baseline with a known reference thickness so every side-by-side sensor reports real thickness."
-        : needsCal ? "Calibrate the sensor against reference pieces so its displacement becomes real thickness."
-        : "This application needs no calibration. Set the input filter and continue."}</p>
       <div class="two-col">
         <div class="panel">
           <h3>${needsCal ? "Calibration" : "No calibration needed"}</h3>
@@ -362,7 +355,6 @@ export async function renderCommission(view, ctx, setCleanup, instanceId) {
         </div>
         <div class="panel">
           <h3>Input filter</h3>
-          <p class="hint">Trimmed mean over the last N readings, so single noisy samples don't cause false FAILs.</p>
           <div class="field"><label>Window (readings, 1 = off)</label><input id="fw" type="number" min="1" value="${esc(cfg["filter.window"] || 1)}" /></div>
           <div class="field"><label>Trim % from each end</label><input id="ft" type="number" min="0" max="45" value="${esc(cfg["filter.trim_pct"] || 10)}" /></div>
           <button class="btn secondary btn-sm" id="fsave">Save filter</button>

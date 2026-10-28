@@ -10,19 +10,41 @@ const RULES = {
 
 // Step 5 — limits (rendered from the template's input definitions) + alert rules.
 export async function renderRules(view, ctx, setCleanup, instanceId) {
-  const [instance, al] = await Promise.all([api.instance(instanceId), api.alerts(instanceId)]);
+  const [instance, al, email] = await Promise.all([
+    api.instance(instanceId),
+    api.alerts(instanceId),
+    api.emailAlertConfig().catch(() => null),
+  ]);
   const cfg = instance.config || {};
   const inputs = (instance.template.inputs || []).filter((f) => !f.key.startsWith("calibration."));
   const inputByKey = Object.fromEntries(inputs.map((f) => [f.key, f]));
   const truthy = (value) => ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
   const rules = al.rules || {};
+  const isAdmin = ["superadmin", "admin"].includes(ctx.session?.user?.role);
+  let emailCfg = email;
+
+  const emailAuthMarkup = (config) => {
+    const googleIcon = `<svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.41-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+      <path fill="#FBBC05" d="M10.53 28.59A14.5 14.5 0 0 1 9.5 24c0-1.59.28-3.14.76-4.59l-7.98-6.19A23.99 23.99 0 0 0 0 24c0 3.8.89 7.4 2.56 10.78l7.97-6.19z"/>
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+    </svg>`;
+    if (!config.google_configured) {
+      return `<p class="email-status bad">Google OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID and
+        GOOGLE_OAUTH_CLIENT_SECRET in backend/.env.</p>`;
+    }
+    if (config.gmail_authenticated) {
+      return `<span class="email-badge good">Gmail authenticated</span>
+        <button class="btn secondary btn-sm" id="econnect" type="button">${googleIcon} Reconnect Google</button>`;
+    }
+    return `<button class="btn secondary btn-sm" id="econnect" type="button">${googleIcon} Sign in with Google</button>`;
+  };
 
   view.innerHTML = `
     <div class="page">
       ${stepper("rules", instanceId)}
       <h1>Limits &amp; alerts</h1>
-      <p class="lead">What counts as good, and who needs to know when it isn't. Fields come from the application
-        template; nothing here is specific to one customer.</p>
       <div class="two-col">
         <div class="panel">
           <h3>Limits</h3>
@@ -43,12 +65,132 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
               ${r.param ? `<div class="rule-param">after <input class="r-param limit-input" type="number" value="${esc(cur.params[r.param] ?? "")}" /> ${esc(r.unit)}</div>` : ""}
             </div>`;
           }).join("")}
-          <p class="hint">Alerts appear on the dashboard. Email / WhatsApp delivery plugs in at the same point.</p>
           <button class="btn secondary btn-sm" id="asave">Save alert rules</button>
         </div>
       </div>
+      ${isAdmin ? (
+        emailCfg ? `<div class="panel email-panel">
+          <h3>Email alerts (Gmail)</h3>
+          <label class="setting-row"><span>Enable email alerts</span>
+            <input type="checkbox" class="setting-toggle email-enabled" ${emailCfg.enabled ? "checked" : ""} /></label>
+          <div class="email-auth-row" id="email-auth">${emailAuthMarkup(emailCfg)}</div>
+          <p class="hint">Authorised redirect URI:
+            <span class="td-mono">${esc(emailCfg.redirect_uri)}</span></p>
+          <div class="field">
+            <label for="email-recipient">Recipient email</label>
+            <input id="email-recipient" type="email" value="${esc(emailCfg.recipient_email)}"
+              placeholder="alerts@company.com" />
+          </div>
+          <div class="email-rule-list">
+            ${Object.entries(RULES).map(([type, r]) => `<label class="setting-row">
+              <span>Email on: ${esc(r.label)}</span>
+              <input type="checkbox" class="setting-toggle email-rule" data-rule="${type}"
+                ${emailCfg.alerts?.[type] !== false ? "checked" : ""} /></label>`).join("")}
+          </div>
+          <div class="field">
+            <label for="email-cooldown">Cooldown (minutes)</label>
+            <input id="email-cooldown" type="number" min="1" max="1440"
+              value="${esc(emailCfg.cooldown?.minutes ?? 5)}" />
+          </div>
+          <div class="email-actions">
+            <button class="btn secondary btn-sm" id="esave" type="button">Save email settings</button>
+            <button class="btn secondary btn-sm" id="etest" type="button">Send test email</button>
+            <span class="email-status" id="email-status"></span>
+          </div>
+        </div>` : `<div class="panel email-panel">
+          <h3>Email alerts (Gmail)</h3>
+          <p class="hint">Could not load email settings. Refresh the page to try again.</p>
+        </div>`
+      ) : `<div class="panel email-panel">
+        <h3>Email alerts (Gmail)</h3>
+        <p class="hint">Email alert settings require a company administrator.</p>
+      </div>`}
       <button class="btn" id="next">Continue to graphs →</button>
     </div>`;
+
+  function setEmailStatus(text, cls) {
+    const el = document.getElementById("email-status");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "email-status" + (cls ? ` ${cls}` : "");
+  }
+
+  function collectEmailConfig() {
+    const alerts = {};
+    view.querySelectorAll(".email-rule").forEach((el) => {
+      alerts[el.dataset.rule] = el.checked;
+    });
+    const minutes = Number(document.getElementById("email-cooldown")?.value);
+    return {
+      enabled: document.querySelector(".email-enabled")?.checked || false,
+      recipient_email: document.getElementById("email-recipient")?.value.trim() || "",
+      alerts,
+      cooldown: { enabled: true, minutes: Number.isFinite(minutes) ? minutes : 5 },
+    };
+  }
+
+  async function saveEmail(quiet) {
+    emailCfg = await api.updateEmailAlertConfig(collectEmailConfig());
+    if (!quiet) toast("Email settings saved");
+    return true;
+  }
+
+  async function connectGoogle() {
+    if (!emailCfg) return;
+    const width = 500;
+    const height = 600;
+    const left = window.screenX + (window.outerWidth - width) / 2;
+    const top = window.screenY + (window.outerHeight - height) / 2;
+    const popup = window.open("", "google-oauth", `width=${width},height=${height},left=${left},top=${top}`);
+    setEmailStatus("Opening Google sign-in...");
+    let auth_url;
+    try {
+      ({ auth_url } = await api.emailAlertAuthUrl());
+    } catch (e) {
+      if (popup) popup.close();
+      throw e;
+    }
+    if (popup) popup.location.href = auth_url;
+    else window.open(auth_url, "google-oauth", `width=${width},height=${height},left=${left},top=${top}`);
+    setEmailStatus("Waiting for Google authentication...");
+
+    let attempts = 0;
+    const timer = setInterval(async () => {
+      attempts += 1;
+      try {
+        const config = await api.emailAlertConfig();
+        if (config.gmail_authenticated) {
+          clearInterval(timer);
+          emailCfg = config;
+          const auth = document.getElementById("email-auth");
+          if (auth) auth.innerHTML = emailAuthMarkup(config);
+          bindEmailAuth();
+          setEmailStatus("Google authentication successful.", "good");
+          if (popup) popup.close();
+        }
+      } catch { /* keep polling */ }
+      if (attempts >= 120) {
+        clearInterval(timer);
+        setEmailStatus("Authentication timed out. Please try again.", "bad");
+      }
+    }, 1000);
+  }
+
+  async function testEmail() {
+    setEmailStatus("Sending test email...");
+    try {
+      await saveEmail(true);
+      await api.testEmailAlert();
+      setEmailStatus("Test email sent.", "good");
+    } catch (e) {
+      setEmailStatus(e.message, "bad");
+    }
+  }
+
+  function bindEmailAuth() {
+    const btn = document.getElementById("econnect");
+    if (btn) btn.addEventListener("click", () => connectGoogle().catch((e) => toast(e.message)));
+  }
 
   async function saveLimits(quiet) {
     const config = {};
@@ -82,10 +224,16 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
   }
   document.getElementById("lsave").addEventListener("click", () => saveLimits().catch((e) => toast(e.message)));
   document.getElementById("asave").addEventListener("click", () => saveRules().catch((e) => toast(e.message)));
+  if (isAdmin && emailCfg) {
+    document.getElementById("esave").addEventListener("click", () => saveEmail().catch((e) => toast(e.message)));
+    document.getElementById("etest").addEventListener("click", () => testEmail());
+    bindEmailAuth();
+  }
   document.getElementById("next").addEventListener("click", async () => {
     try {
       if (!(await saveLimits(true))) return;
       await saveRules(true);
+      if (isAdmin && emailCfg) await saveEmail(true);
       ctx.navigate(`#/setup/${instanceId}/graphs`);
     } catch (e) { toast(e.message); }
   });

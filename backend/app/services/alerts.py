@@ -52,6 +52,12 @@ def _emit(company_id, instance_id: str, device_id: Optional[str], rule_type: str
         "VALUES (%s, %s, %s, %s, %s, %s)",
         (company_id, instance_id, device_id, rule_type, severity, message),
     )
+    try:
+        from . import email_alerts
+
+        email_alerts.notify(company_id, instance_id, device_id, rule_type, severity, message)
+    except Exception:
+        pass
 
 
 def _resolve(instance_id: str, rule_type: str, device_id: Optional[str]) -> None:

@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
-from .routers import auth, catalog, demo_customer, devices, gateway, instance_setup, instances, meta
+from .routers import auth, catalog, demo_customer, devices, email_alerts, gateway, instance_setup, instances, meta
 from .services.dashboard import invalidate_dashboards
 
 
@@ -68,9 +68,10 @@ async def static_cache_policy(request, call_next):
         response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
     return response
 
-for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer):
+for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer, email_alerts):
     app.include_router(module.router)
 app.include_router(gateway.push_router)
+app.include_router(email_alerts.legacy_router)
 
 # Serve the frontend last so /api/v1 routes take precedence.
 if FRONTEND_DIR.exists():

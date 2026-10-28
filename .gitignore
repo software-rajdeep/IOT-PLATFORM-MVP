@@ -1,5 +1,6 @@
 # separate projects with their own repositories
 thickness-monitoring/
+thickness_server_sidebyside/
 /IoT Platform/
 
 # secrets & local env
@@ -7,6 +8,8 @@ thickness-monitoring/
 backend/.env
 secrets.local.md
 *.log
+# Gmail OAuth tokens + per-company email settings
+backend/data/
 
 # python
 __pycache__/

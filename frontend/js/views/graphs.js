@@ -11,7 +11,6 @@ export async function renderGraphs(view, ctx, setCleanup, instanceId, mode = "se
   const widgets = opts.widgets || [];
   const available = widgets.filter((w) => w.status === "available");
   const locked = widgets.filter((w) => w.status === "locked");
-  const na = widgets.filter((w) => w.status === "not_applicable");
   const setup = mode === "setup";
 
   view.innerHTML = `
@@ -19,8 +18,6 @@ export async function renderGraphs(view, ctx, setCleanup, instanceId, mode = "se
       ${setup ? stepper("graphs", instanceId) : `<div class="crumbs"><a href="#/apps">Applications</a><span class="sep">/</span>
         <a href="#/app/${esc(instanceId)}">${esc(instance.name)}</a><span class="sep">/</span><b>Customize</b></div>`}
       <h1>${setup ? "Choose your graphs" : "Customize dashboard"}</h1>
-      <p class="lead">These are the graphs that fit <b>${esc(instance.template.name)}</b> with the data you mapped.
-        Drag to move, pull the corner to resize, × to remove.</p>
       <div class="graphs-layout">
         <aside class="panel lib">
           <h3>Available · ${available.length}</h3>
@@ -29,7 +26,6 @@ export async function renderGraphs(view, ctx, setCleanup, instanceId, mode = "se
           ${locked.length ? `<h3 style="margin-top:16px">Locked · ${locked.length}</h3>
           ${locked.map((w) => `<a class="lib-item locked" href="#/setup/${esc(instanceId)}/map">
             <b>${esc(w.name)}</b><span>Map <u>${esc(w.unlock_with.join(", "))}</u> to unlock</span><i>🔒</i></a>`).join("")}` : ""}
-          ${na.length ? `<div class="hint" style="margin-top:12px">${na.length} other graph types don't apply to this application.</div>` : ""}
         </aside>
         <div>
           <div class="run-actions" style="margin-bottom:10px">

@@ -96,16 +96,13 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
 
   const head = `
     ${stepper("map", instanceId)}
-    <h1>Map your data</h1>
-    <p class="lead">Tell the platform which field in the source means what. The application only understands its
-      standard fields; everything customer-specific stays here.</p>`;
+    <h1>Map your data</h1>`;
 
   function drawPreset() {
     const def = info.current.definition;
     view.innerHTML = `<div class="page">${head}
       <div class="panel">
         <h3>Automatic mapping · device preset</h3>
-        <p class="hint">This source is our own connector, so the platform already knows its data. Nothing to map.</p>
         <div class="table-wrap"><table><thead><tr><th>Standard field</th><th>From</th><th>Conversion</th></tr></thead><tbody>
           ${def.fields.map((f) => `<tr><td class="td-mono">${esc(f.target)}</td><td class="td-mono">${esc(f.path)}</td>
             <td class="td-mono">${esc(describe(f.transforms))}</td></tr>`).join("")}

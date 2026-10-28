@@ -8,3 +8,7 @@ itsdangerous
 
 # Optional, only needed to talk to a REAL RS-485 sensor.
 # pyserial
+
+# Optional, only needed for Gmail OAuth email alerts (lazy-loaded at runtime).
+# google-auth-oauthlib
+# google-api-python-client
