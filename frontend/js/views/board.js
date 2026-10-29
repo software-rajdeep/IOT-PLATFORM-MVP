@@ -48,24 +48,40 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     if (onChange) onChange();
   }
 
+  function paint(it, data, force = false) {
+    const title = it.title || (DEFAULT_TITLES[it.type] ? DEFAULT_TITLES[it.type](data) : it.type);
+    const titleEl = it.el.querySelector(".w-title");
+    if (titleEl.textContent !== title) titleEl.textContent = title;
+    if (!force && STATIC_WIDGETS.has(it.type) && it.drawn) return;
+    const html = renderWidget(it.type, data, it.state);
+    it.drawn = true;
+    if (html === it.html) return;
+    it.el.querySelector(".w-body").innerHTML = html;
+    it.html = html;
+  }
+
   function update(data) {
     last = data;
+    const active = document.activeElement;
     for (const it of items.values()) {
-      const title = it.title || (DEFAULT_TITLES[it.type] ? DEFAULT_TITLES[it.type](data) : it.type);
-      const titleEl = it.el.querySelector(".w-title");
-      if (titleEl.textContent !== title) titleEl.textContent = title;
-      if (STATIC_WIDGETS.has(it.type) && it.drawn) continue;
-      const html = renderWidget(it.type, data, it.state);
-      it.drawn = true;
-      if (html === it.html) continue;
-      it.el.querySelector(".w-body").innerHTML = html;
-      it.html = html;
+      // Live refreshes must not yank a control the user is using (an open sensor
+      // dropdown, a limit being typed): skip that card until focus leaves the field.
+      // Buttons are excluded — clicking "ack" or "Save" should still repaint the card.
+      if (active && active.closest && active.closest("select, input, textarea")
+        && it.el.querySelector(".w-body").contains(active)) continue;
+      paint(it, data);
     }
   }
 
   function redraw(type) {
-    for (const it of items.values()) if (it.type === type) it.drawn = false;
-    if (last) update(last);
+    if (!last) return;
+    // Explicit repaint for one card type (after a save, say) — forced so a card that holds
+    // inputs, or one whose Save button still has focus, really refreshes.
+    for (const it of items.values()) {
+      if (it.type !== type) continue;
+      it.drawn = false;
+      paint(it, last, true);
+    }
   }
 
   function getLayout() {
@@ -90,7 +106,10 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     const it = itemEl && items.get(itemEl.getAttribute("gs-id"));
     if (!it) return;
     it.state = { ...it.state, sensor: sel.value };
-    if (last) update(last);
+    // Repaint this card straight away so the pinned sensor shows without waiting for the
+    // next live tick (update() skips focused cards, and the select keeps focus). Forced,
+    // because input-holding cards (limits) are otherwise painted only once.
+    if (last) paint(it, last, true);
   });
 
   return { grid, add, remove, update, redraw, getLayout, types: () => [...items.values()].map((i) => i.type),

@@ -19,7 +19,7 @@ from ..db import fetch_all, fetch_one
 from . import alerts
 from .devices import load_device, serialize_device
 from .instances import _json, get_instance, instance_device_ids, load_config
-from .limits import bounds
+from .limits import bounds, sensor_bounds, sensor_overrides
 from .mappings import active_mapping
 from .opposite_calibration import (
     ZERO_OFFSET_MM,
@@ -331,6 +331,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             distance = None
             if processor_key == "opposite_thickness" and value is not None:
                 distance = round(ZERO_OFFSET_MM + value, 6)
+            s_lower, s_upper, s_override = sensor_bounds(config, thickness_key, lower, upper)
             sensors.append({
                 "key": k,
                 "label": f"Sensor {i + 1}" + (" (reference)" if k == ref_key else ""),
@@ -340,6 +341,8 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
                 "status": latest_fields.get(status_key),
                 "error": _num(latest_fields.get("reference.error_mm")) if k == ref_key else None,
                 "is_reference": k == ref_key,
+                "limit_field": thickness_key,
+                "limits": {"lower": s_lower, "upper": s_upper, "target": target, "override": s_override},
                 "series": per_key[k],
                 "thickness_series": thickness_series.get(k),
             })
@@ -376,6 +379,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             "target": target, "lower": lower, "upper": upper,
             "limit_active": limit_active,
             "keys": limit_keys,
+            "sensor_limits": sensor_overrides(config),
             "calibration.scale": _num(config.get("calibration.scale")),
             "calibration.offset": _num(config.get("calibration.offset")),
             "calibration.mode": config.get("calibration.mode") or "auto",

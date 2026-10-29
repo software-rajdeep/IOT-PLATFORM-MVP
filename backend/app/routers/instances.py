@@ -284,6 +284,9 @@ def calibrate(instance_id: str, body: CalibrateRequest, user: dict = Depends(get
 class BaselineCalibrateRequest(BaseModel):
     reference_thickness: float
     readings: Optional[dict] = None
+    # Capture one sensor only and keep the other baselines (the dashboard's per-sensor
+    # calibration). Omitted = capture every sensor at once, as before.
+    sensor: Optional[str] = None
 
 
 def _calibration_live(row: dict) -> dict:
@@ -369,7 +372,14 @@ def calibrate_baseline(instance_id: str, body: BaselineCalibrateRequest,
     if not readings:
         raise HTTPException(status_code=400, detail="No sensor readings received yet. Wait for data and try again.")
 
-    baselines = {key: round(value, 6) for key, value in readings}
+    existing = parse_baselines(config)
+    if body.sensor:
+        readings = [(key, value) for key, value in readings if key == body.sensor]
+        if not readings:
+            raise HTTPException(
+                status_code=400,
+                detail="That sensor is not reporting right now. Wait for a reading from it and try again.")
+    baselines = {**(existing if body.sensor else {}), **{key: round(value, 6) for key, value in readings}}
     keys = list(baselines)
     ref_key = reference_key(config, keys)
     calibrated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -387,7 +397,7 @@ def calibrate_baseline(instance_id: str, body: BaselineCalibrateRequest,
     })
     audit.log(user, "calibration.baseline", "instance", instance_id, before,
               {"reference_thickness": body.reference_thickness, "baselines": baselines,
-               "reference_sensor_key": ref_key})
+               "reference_sensor_key": ref_key, "sensor": body.sensor})
     return {
         "calibration.mode": "baseline",
         "calibration.reference_thickness": round(body.reference_thickness, 6),

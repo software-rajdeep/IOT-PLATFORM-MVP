@@ -129,22 +129,59 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
   let stopCal = null;
 
   const handlers = {
-    recalibrate: () => {
+    recalibrate: (btn) => {
+      // The calibration card can be pinned to one sensor, in which case the panel captures
+      // (and merges) that sensor's baseline only.
+      const picker = btn.closest(".w-body")?.querySelector("[data-sensor-select]");
+      const sensor = picker && picker.value ? picker.value : null;
       show("cal-modal");
       stopCal = calibrationPanel($("cal-host"), instanceId, activeDevice, () => refresh(),
-        { mode: (instance.template.commissioning || {}).calibration });
+        { mode: (instance.template.commissioning || {}).calibration, sensor });
     },
     "reset-calibration": async () => {
       try { await api.resetCalibration(instanceId); toast("Calibration reset"); refresh(); }
       catch (err) { toast(err.message); }
     },
     "save-limits": async (btn) => {
-      const config = {};
       const body = btn.closest(".w-body");
-      body.querySelectorAll("[data-limit]").forEach((el) => { config[el.dataset.limit] = el.value === "" ? null : Number(el.value); });
-      body.querySelectorAll("[data-limit-flag]").forEach((el) => { config[el.dataset.limitFlag] = el.checked; });
-      try { await api.updateInstance(instanceId, { config }); toast("Limits saved"); board.redraw("limits_editor"); refresh(); }
-      catch (err) { toast(err.message); }
+      const scoped = body.querySelector("[data-sensor-limits]");
+      const field = body.querySelector("[data-sensor-select]")?.selectedOptions[0]?.dataset.field || "";
+      try {
+        if (scoped && field) {
+          // Per-sensor bounds live in the same JSON map the alert engine reads, so the
+          // dashboard PASS/FAIL and the alerts stay in step. Merge, never replace.
+          const map = JSON.parse(scoped.dataset.sensorLimits || "{}");
+          const read = (name) => {
+            const raw = body.querySelector(`[data-limit="${name}"]`).value;
+            return raw === "" ? null : Number(raw);
+          };
+          const entry = { ...(map[field] || {}), lower: read("lower"), upper: read("upper") };
+          if (entry.lower == null && entry.upper == null) delete map[field];
+          else map[field] = entry;
+          await api.updateInstance(instanceId, { config: { "event.sensor_limits": JSON.stringify(map) } });
+          toast("Sensor limits saved");
+        } else {
+          const config = {};
+          body.querySelectorAll("[data-limit]").forEach((el) => { config[el.dataset.limit] = el.value === "" ? null : Number(el.value); });
+          body.querySelectorAll("[data-limit-flag]").forEach((el) => { config[el.dataset.limitFlag] = el.checked; });
+          await api.updateInstance(instanceId, { config });
+          toast("Limits saved");
+        }
+        await refresh();
+        board.redraw("limits_editor");
+      } catch (err) { toast(err.message); }
+    },
+    "clear-sensor-limits": async (btn) => {
+      const body = btn.closest(".w-body");
+      const field = body.querySelector("[data-sensor-select]")?.selectedOptions[0]?.dataset.field || "";
+      const map = JSON.parse(body.querySelector("[data-sensor-limits]")?.dataset.sensorLimits || "{}");
+      try {
+        delete map[field];
+        await api.updateInstance(instanceId, { config: { "event.sensor_limits": JSON.stringify(map) } });
+        toast("Sensor now follows the global limits");
+        await refresh();
+        board.redraw("limits_editor");
+      } catch (err) { toast(err.message); }
     },
     ack: async (eventId) => { try { await api.ackAlert(instanceId, eventId); refresh(); } catch (err) { toast(err.message); } },
   };

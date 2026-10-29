@@ -597,6 +597,17 @@ h2 { font-size: 18px; margin: 0 0 4px; }
 .raw-select select { background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 3px 6px; font-size: 12px; font-family: var(--mono); max-width: 180px; }
 .raw-select select:focus { border-color: var(--accent); }
+/* Cards with a sensor picker above the content: the picker spans the card and shrinks
+   with the grid cell instead of overflowing a narrow 2-column widget. */
+.widget[data-type="current_value"] .raw-head,
+.widget[data-type="calibration_status"] .raw-head,
+.widget[data-type="limits_editor"] .raw-head { justify-content: flex-start; margin-bottom: 8px; }
+.widget[data-type="current_value"] .raw-select,
+.widget[data-type="calibration_status"] .raw-select,
+.widget[data-type="limits_editor"] .raw-select { width: 100%; min-width: 0; }
+.widget[data-type="current_value"] .raw-select select,
+.widget[data-type="calibration_status"] .raw-select select,
+.widget[data-type="limits_editor"] .raw-select select { flex: 1 1 auto; min-width: 0; max-width: none; }
 .raw-current-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
 .raw-current-item { min-width: 0; }
 .raw-current-item .big { margin-top: 6px; }

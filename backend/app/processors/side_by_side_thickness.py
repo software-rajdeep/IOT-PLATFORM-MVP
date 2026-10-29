@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from .registry import register
 from .rubber_thickness import _num
-from ..services.limits import bounds, status
+from ..services.limits import bounds, sensor_bounds, status
 from ..services.sbs_calibration import (
     DEFAULT_INPUT_KEY,
     derived_key,
@@ -94,15 +94,18 @@ def side_by_side_thickness(config: dict, fields: dict) -> dict:
         result["thickness.deviation_mm"] = round(actual - target, 6)
 
     if sensor_thickness:
+        statuses = []
         for key, thickness in sensor_thickness.items():
-            result[derived_key("thickness.sensor_mm", key)] = thickness
-            sensor_status = status(thickness, lower, upper, limit_active)
+            field = derived_key("thickness.sensor_mm", key)
+            lo, hi, _ = sensor_bounds(config, field, lower, upper)
+            result[field] = thickness
+            sensor_status = status(thickness, lo, hi, limit_active)
             if sensor_status is not None:
                 result[derived_key("quality.sensor_status", key)] = sensor_status
-        sensor_statuses = [status(value, lower, upper, limit_active) for value in sensor_thickness.values()]
-        if any(item == "FAIL" for item in sensor_statuses):
+            statuses.append(status(thickness, lo, hi, limit_active))
+        if any(item == "FAIL" for item in statuses):
             result["quality.status"] = "FAIL"
-        elif any(item == "PASS" for item in sensor_statuses):
+        elif any(item == "PASS" for item in statuses):
             result["quality.status"] = "PASS"
     else:
         result["quality.status"] = status(actual, lower, upper, limit_active)

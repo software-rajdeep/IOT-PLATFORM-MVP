@@ -5,7 +5,10 @@ import { stepper } from "./stepper.js";
 // Baseline calibration for side-by-side sensors: capture one reading per sensor
 // with a known reference thickness. thickness = reference + (baseline - current),
 // plus the reference-sensor drift when a reference column is configured.
-function baselinePanel(host, instanceId, onSaved) {
+// options.sensor limits the capture to one sensor (dashboard's per-sensor picker); the
+// other baselines are kept, so one sensor can be re-calibrated on its own.
+function baselinePanel(host, instanceId, onSaved, options = {}) {
+  const only = options.sensor || null;
   host.innerHTML = `
     <div class="live-read"><span class="k">Live sensors</span><span class="v" id="bl-live">—</span></div>
         <div id="bl-source" class="hint" style="margin:6px 0"></div>
@@ -14,7 +17,7 @@ function baselinePanel(host, instanceId, onSaved) {
       <th class="td-r">Baseline</th></tr></thead><tbody id="bl-sensors"></tbody></table></div>
     <div class="cal-read-row" style="margin-top:12px">
       <input id="bl-t" class="limit-input" type="number" step="any" placeholder="reference thickness mm" />
-      <button type="button" class="btn btn-sm" id="bl-save">Capture &amp; save calibration</button>
+      <button type="button" class="btn btn-sm" id="bl-save">${only ? "Capture this sensor" : "Capture &amp; save calibration"}</button>
     </div>
     <div id="bl-result" class="hint" style="margin-top:10px"></div>`;
   const $ = (id) => host.querySelector("#" + id);
@@ -22,17 +25,27 @@ function baselinePanel(host, instanceId, onSaved) {
   let live = null;
   let prefilled = false;
   let busy = false;
+  let onlyLabel = "";
 
   function renderSensors(data) {
-    const rows = (data.sensors || []).map((sensor) => {
-      const baseline = data.baselines ? data.baselines[sensor.key] : null;
-      const name = `${sensor.label}${sensor.is_reference ? " (reference)" : ""}`;
-      return `<tr><td>${esc(name)}<div class="td-mono td-dim">${esc(sensor.key)}</div></td>
+    const all = data.sensors || [];
+    if (only) {
+      const match = all.find((sensor) => sensor.key === only);
+      onlyLabel = match ? match.label : only;
+    }
+    const rows = all
+      .filter((sensor) => !only || sensor.key === only)
+      .map((sensor) => {
+        const baseline = data.baselines ? data.baselines[sensor.key] : null;
+        const name = `${sensor.label}${sensor.is_reference ? " (reference)" : ""}`;
+        return `<tr><td>${esc(name)}<div class="td-mono td-dim">${esc(sensor.key)}</div></td>
         <td class="td-r td-mono">${sensor.value == null ? "—" : Number(sensor.value).toFixed(3)}</td>
         <td class="td-r td-mono">${baseline == null ? "—" : Number(baseline).toFixed(3)}</td></tr>`;
-    }).join("");
+      }).join("");
     $("bl-sensors").innerHTML = rows || `<tr><td colspan="3" class="td-dim">waiting for readings…</td></tr>`;
-    $("bl-live").textContent = data.sensors && data.sensors.length ? `${data.sensors.length} sensor(s)` : "no data";
+    $("bl-live").textContent = only
+      ? `${onlyLabel || "Sensor"} · ${all.filter((sensor) => sensor.key === only && sensor.value != null).length ? "live" : "no reading"}`
+      : (all.length ? `${all.length} sensor(s)` : "no data");
     $("bl-source").textContent = data.source_mode === "replay"
       ? "Old readings are being replayed from the customer database (no live sensor connected)."
       : "";
@@ -68,12 +81,17 @@ function baselinePanel(host, instanceId, onSaved) {
     busy = true;
     $("bl-save").disabled = true;
     try {
-      const data = await api.calibrateBaseline(instanceId, { reference_thickness: thickness });
+      const data = await api.calibrateBaseline(instanceId, {
+        reference_thickness: thickness,
+        ...(only ? { sensor: only } : {}),
+      });
       const count = Object.keys(data["calibration.baselines"] || {}).length;
-      $("bl-result").innerHTML = `<span class="badge good">calibrated</span> ${count} sensor(s) ·
+      $("bl-result").innerHTML = `<span class="badge good">calibrated</span> ${only
+        ? `${esc(onlyLabel || only)} baseline captured · ${count} sensor(s) calibrated`
+        : `${count} sensor(s)`} ·
         reference ${fmt(data["calibration.reference_thickness"])} mm`;
       prefilled = true;
-      toast("Baseline calibration saved");
+      toast(only ? `${onlyLabel || "Sensor"} calibrated` : "Baseline calibration saved");
       if (onSaved) onSaved(data);
       await poll();
     } catch (err) { toast(err.message); }
@@ -220,7 +238,7 @@ function oppositePanel(host, instanceId, onSaved) {
 // Two-point calibration wizard with a verification piece. Used by onboarding step 4 and
 // by the dashboard's calibration widget. thickness = scale x displacement + offset.
 export function calibrationPanel(host, instanceId, deviceId, onSaved, options = {}) {
-  if (options.mode === "baseline") return baselinePanel(host, instanceId, onSaved);
+  if (options.mode === "baseline") return baselinePanel(host, instanceId, onSaved, options);
   if (options.mode === "gap" || options.mode === "auto_gap" || options.mode === "opposite") {
     return oppositePanel(host, instanceId, onSaved);
   }

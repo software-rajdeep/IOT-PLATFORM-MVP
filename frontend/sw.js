@@ -1,7 +1,7 @@
 // Service worker: cache the static SPA shell so repeat page loads are instant.
 // API responses are never cached (live data must always be fresh).
 // Bump VERSION whenever the static file list changes to force a clean precache.
-const VERSION = "ucap-v4";
+const VERSION = "ucap-v6";
 const STATIC_CACHE = `ucap-static-${VERSION}`;
 const SHELL_CACHE = `ucap-shell-${VERSION}`;
 

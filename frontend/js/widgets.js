@@ -31,6 +31,21 @@ export const DEFAULT_TITLES = {
 export const STATIC_WIDGETS = new Set(["limits_editor"]);
 
 const cls = (status) => (status === "FAIL" ? "bad" : status === "PASS" ? "good" : "muted");
+// What one sensor contributes to a "current" card: a reference sensor reports its error
+// against the reference, the others report computed thickness and fall back to raw input.
+const currentOf = (s) => (s.is_reference
+  ? (s.error ?? s.thickness ?? s.distance ?? s.value)
+  : (s.thickness ?? s.distance ?? s.value));
+
+// Sensor picker shared by the current-value, calibration and limits cards. The board keeps
+// the choice in the card's state and hands it back through renderWidget(..., state).
+function sensorSelect(list, selected, allLabel = "All sensors", alwaysAll = false) {
+  const opts = ((list.length > 1 || alwaysAll)
+    ? `<option value=""${selected ? "" : " selected"}>${esc(allLabel)}</option>` : "")
+    + list.map((s) => `<option value="${esc(s.key)}" data-field="${esc(s.limit_field || "")}"${s.key === selected ? " selected" : ""}>${esc(s.label || s.key)}</option>`).join("");
+  return `<div class="raw-head"><label class="raw-select">Sensor <select data-sensor-select>${opts}</select></label></div>`;
+}
+
 const W = 720;
 
 function bounds(values, extra = []) {
@@ -121,8 +136,24 @@ export function renderWidget(type, d, state = {}) {
   const c = d.current || {}, s = d.statistics || {}, q = d.quality || {}, cfg = d.config || {};
   const u = esc(d.unit || "");
   switch (type) {
-    case "current_value":
-      return `<div class="big ${cls(c.status)}">${fmt(c.value)}<span class="u">${u}</span></div>`;
+    case "current_value": {
+      // Several sources can feed the same input (Sensor 1, Sensor 2, ...). The card keeps
+      // showing the overall value by default and lets the user pin one sensor; the choice
+      // lives in the board item's state, so it survives the live refresh.
+      const list = d.sensors || [];
+      if (!list.length) return `<div class="big ${cls(c.status)}">${fmt(c.value)}<span class="u">${u}</span></div>`;
+      const keys = list.map((s) => s.key);
+      const selected = keys.includes(state.sensor) ? state.sensor : (list.length === 1 ? list[0].key : "");
+      const sel = list.find((s) => s.key === selected);
+      const shown = sel ? currentOf(sel) : c.value;
+      const status = sel ? sel.status : c.status;
+      const caption = sel
+        ? `${sel.is_reference ? "reference error" : (sel.thickness != null ? "thickness" : "raw input")}`
+        : (list.length > 1 ? `all ${list.length} sensors` : "");
+      return `${sensorSelect(list, selected)}
+        <div class="big ${cls(status)}">${fmt(shown)}<span class="u">${u}</span></div>
+        ${caption ? `<div class="stat-sub">${esc(caption)}</div>` : ""}`;
+    }
     case "target_deviation":
       return `<div class="big">${fmt(cfg.target)}<span class="u">${u}</span></div>`;
     case "pass_fail":
@@ -162,26 +193,57 @@ export function renderWidget(type, d, state = {}) {
       return `<div class="big" style="font-size:16px">${esc(h.model || h.device_id || "—")}</div>`;
     }
     case "calibration_status": {
-      const done = !!cfg["calibration.calibrated_at"];
-      const baselines = cfg["calibration.baselines"] || {};
       const gap = cfg["calibration.gap_distance"];
+      const baselines = cfg["calibration.baselines"] || {};
       const isGap = cfg["calibration.mode"] === "gap" || cfg["calibration.mode"] === "auto_gap" || gap != null;
       const isBaseline = !isGap && (cfg["calibration.mode"] === "baseline" || Object.keys(baselines).length > 0);
-      const detail = isGap
+      // Baseline calibration stores one baseline per sensor, so it can be done one sensor
+      // at a time. The other methods calibrate the whole device, so they get no picker.
+      const list = d.sensors || [];
+      const method = ((d.template || {}).commissioning || {}).calibration;
+      const perSensor = method === "baseline" && list.length > 1;
+      const selected = perSensor && list.some((s) => s.key === state.sensor) ? state.sensor : "";
+      const sel = list.find((s) => s.key === selected);
+      const done = sel ? baselines[sel.key] != null : !!cfg["calibration.calibrated_at"];
+      const detail = sel
+        ? `baseline ${sel.key in baselines ? `${fmt(baselines[sel.key])} ${u}` : "—"} · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
+        : isGap
         ? `gap ${fmt(gap)} ${u}${cfg["calibration.object_thickness"] != null
           ? ` · object ${fmt(cfg["calibration.object_thickness"])} ${u}` : ""}${cfg["calibration.tolerance_mm"] != null
           ? ` · ±${fmt(cfg["calibration.tolerance_mm"])} ${u}` : ""}`
         : isBaseline
         ? `baseline on ${Object.keys(baselines).length || 0} sensor(s) · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
         : `${d.label.toLowerCase()} = ${fmt(cfg["calibration.scale"], 4)} × input + ${fmt(cfg["calibration.offset"], 4)}`;
-      return `<div class="cal-status-row"><span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : "not calibrated"}</span>
+      return `${perSensor ? sensorSelect(list, selected) : ""}<div class="cal-status-row">
+        <span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : "not calibrated"}</span>
         <button class="btn btn-sm" data-act="recalibrate">${done ? "Recalibrate" : "Calibrate"}</button>
         ${done ? `<button class="btn secondary btn-sm" data-act="reset-calibration">Reset</button>` : ""}</div>
         <div class="stat-sub">${esc(detail)}
-        ${done ? `<br/>by ${esc(cfg["calibration.calibrated_by"] || "")} · ${esc(new Date(cfg["calibration.calibrated_at"]).toLocaleString())}` : ""}</div>`;
+        ${done && !sel ? `<br/>by ${esc(cfg["calibration.calibrated_by"] || "")} · ${esc(new Date(cfg["calibration.calibrated_at"]).toLocaleString())}` : ""}</div>`;
     }
     case "limits_editor": {
       const keys = cfg.keys || {};
+      const list = d.sensors || [];
+      const selected = list.some((s) => s.key === state.sensor) ? state.sensor : "";
+      const sensor = list.find((s) => s.key === selected);
+      // A sensor can carry its own bounds (stored as event.sensor_limits, the same map the
+      // alert engine reads); with nothing selected the card edits the instance limits.
+      if (sensor) {
+        const lim = sensor.limits || {};
+        const map = JSON.stringify(cfg.sensor_limits || {});
+        return `${sensorSelect(list, selected)}
+          <div class="limits-row" data-sensor-limits="${esc(map)}">
+            <label><span class="limit-label">lower ${u}</span>
+              <input class="limit-input" data-limit="lower" type="number" step="any" value="${lim.lower ?? ""}"/></label>
+            <label><span class="limit-label">upper ${u}</span>
+              <input class="limit-input" data-limit="upper" type="number" step="any" value="${lim.upper ?? ""}"/></label>
+            <button class="btn btn-sm" data-act="save-limits">Save</button>
+            ${lim.override ? `<button class="btn secondary btn-sm" data-act="clear-sensor-limits">Use global</button>` : ""}
+          </div>
+          <div class="stat-sub">${esc(sensor.label || sensor.key)} · ${lim.override
+            ? "own limits" : `inherits the global limits (${fmt(cfg.lower)} – ${fmt(cfg.upper)}, ${u})`}
+            ${keys.limit_active ? "" : " · value limit is off"}</div>`;
+      }
       const fields = [
         ["target", keys.target, cfg.target],
         ["lower", keys.lower, cfg.lower],
@@ -189,7 +251,7 @@ export function renderWidget(type, d, state = {}) {
         ["reference lower", keys.reference_lower, cfg.reference_lower],
         ["reference upper", keys.reference_upper, cfg.reference_upper],
       ].filter(([, key]) => key);
-      return `<div class="limits-row">
+      return `${sensorSelect(list, selected, "Global limits", true)}<div class="limits-row">
         ${fields.map(([label, key, value]) => `<label><span class="limit-label">${esc(label)} ${u}</span>
           <input class="limit-input" data-limit="${esc(key)}" type="number" step="any" value="${value ?? ""}"/></label>`).join("")}
         ${(keys.lower || keys.upper) ? `<label class="limit-check"><input type="checkbox" data-limit-flag="${esc(keys.limit_active || "thickness.limit_active")}"

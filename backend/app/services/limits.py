@@ -6,6 +6,7 @@ processor (side-by-side, opposite, single-sensor, generic) behaves the same.
 """
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 
@@ -52,3 +53,38 @@ def status(value, lower: Optional[float], upper: Optional[float], active: bool =
     if value is None or not active or (lower is None and upper is None):
         return None
     return "PASS" if inside(float(value), lower, upper) else "FAIL"
+
+
+def sensor_overrides(config: dict) -> dict:
+    """Per-sensor limit overrides, keyed by the sensor's measured field.
+
+    Stored as JSON under ``event.sensor_limits`` (the key the incident engine already
+    reads) so the dashboard PASS/FAIL and the alerts agree, e.g.
+    ``{"thickness.sensor_mm.2": {"lower": 1.0, "upper": 2.0}}``.
+    """
+    config = config or {}
+    raw = config.get("event.sensor_limits") or config.get("sensor_limits")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def sensor_bounds(config: dict, sensor_field: Optional[str],
+                  lower: Optional[float], upper: Optional[float]) -> tuple[Optional[float], Optional[float], bool]:
+    """Effective ``(lower, upper, overridden)`` for one sensor.
+
+    A sensor with no entry (or an unreadable one) simply inherits the instance limits,
+    so partial overrides — only a lower bound, say — keep the other side global.
+    """
+    entry = sensor_overrides(config).get(sensor_field) if sensor_field else None
+    if not isinstance(entry, dict):
+        return lower, upper, False
+    lo = number(entry.get("lower", entry.get("min")))
+    hi = number(entry.get("upper", entry.get("max")))
+    return (lower if lo is None else lo), (upper if hi is None else hi), True
