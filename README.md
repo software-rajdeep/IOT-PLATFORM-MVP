@@ -150,7 +150,58 @@ curl -X POST http://<server>/api/v1/gateway/measurements \
 | POST | `/api/v1/email-alerts/test` | send a test email |
 | GET | `/api/v1/email-alerts/auth-url` | start Google sign-in |
 | GET | `/api/v1/email-alerts/oauth-callback` | Google OAuth callback |
+| GET | `/api/v1/events/active` | current out-of-range / offline incidents |
+| GET | `/api/v1/events/incidents` | historical incidents (filters, `from`/`to`) |
+| GET | `/api/v1/events/incidents/{id}` | incident details + queued notifications |
+| GET | `/api/v1/events/counts` | daily incident counts and summaries |
+| GET | `/api/v1/events/connectivity` | machine / source connectivity status |
+| POST | `/api/v1/events/connectivity/check` | run the freshness check now |
 | POST | `/api/v1/gateway/measurements` | gateway ingest (raw) |
+
+## Event engine (Phase 3)
+
+Out-of-range incidents are evaluated after each processed measurement. Thresholds
+come from the existing limit configuration (`thickness.lower_limit_mm` /
+`thickness.upper_limit_mm`, or the template's `field_roles.lower` / `upper`).
+Per-sensor overrides can be set with `event.sensor_limits` (JSON keyed by sensor
+field) or `<field>.lower_limit` / `<field>.upper_limit`.
+
+Optional recovery configuration is set through the normal instance config API:
+`event.hysteresis_mm`, `event.debounce_readings`, `event.debounce_seconds`,
+`event.recovery_readings`, `event.recovery_seconds`, `event.severity`;
+connectivity uses `connectivity.heartbeat_seconds` (or
+`connectivity.freshness_seconds`). Incidents are stored independently of
+`metrics.measurements`, and opened / closed events are queued in
+`metrics.event_notifications` for future WhatsApp delivery. No messages are sent.
+
+## Rajdeep AI Assistant (read-only)
+
+The assistant answers questions about the current company's applications,
+readings, statistics, limits, alerts, calibration, connectivity and reports. The
+web UI is the floating **Rajdeep AI Assistant** panel; the same channel-neutral
+service is used by the WhatsApp adapter.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/ai/chat` | authenticated web chat |
+| POST | `/api/v1/whatsapp/link-code` | generate a 15-minute code to link a WhatsApp number |
+| GET | `/api/v1/whatsapp/identities` | list linked WhatsApp numbers (company-scoped) |
+| DELETE | `/api/v1/whatsapp/identities/{id}` | block a linked number (admin) |
+| GET | `/api/v1/whatsapp/webhook` | Meta webhook verification |
+| POST | `/api/v1/whatsapp/webhook` | signed Meta webhook |
+| POST | `/api/v1/whatsapp/test-message` | local end-to-end test in `mock` mode (admin) |
+
+Configuration is in `backend/.env.example`: `AI_PROVIDER` (openai-compatible,
+anthropic, or disabled), `AI_API_KEY`, `AI_MODEL`, `AI_BASE_URL`, and the
+`WHATSAPP_*` variables. Keys stay server-side and are never returned by the API.
+While the Meta developer account is not ready, keep `WHATSAPP_DRIVER=mock`:
+replies are stored in `core.ai_outbox` and logged, not sent. After the account is
+ready, set `WHATSAPP_DRIVER=graph`, the verify token, app secret, access token and
+phone-number id, then point the Meta webhook at
+`https://<host>/api/v1/whatsapp/webhook`.
+
+The assistant is read-only: it cannot change limits, calibrate, acknowledge
+alerts or control equipment.
 
 ## Acceptance criteria (V1)
 
@@ -176,8 +227,11 @@ backend/
     services/processing.py        BLOCK 5 pipeline + rules
     services/dashboard.py         BLOCK 6
     services/{devices,instances,calibration}.py
+    services/event_engine.py      reusable incident state machine
+    services/incidents.py         incident persistence, connectivity, summaries
+    services/ai_assistant/        read-only AI chat, analytics tools, WhatsApp adapter
     services/email_alerts.py      Gmail OAuth delivery (optional)
-    routers/{auth,catalog,devices,instances,gateway,meta,email_alerts}.py
+    routers/{auth,catalog,devices,instances,gateway,meta,email_alerts,events,ai,whatsapp}.py
     simulator.py                  runs the real connector in simulation
   database/{schema.sql,seed.sql}
   scripts/init_db.py

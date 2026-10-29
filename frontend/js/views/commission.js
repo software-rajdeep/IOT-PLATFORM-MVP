@@ -16,10 +16,7 @@ function baselinePanel(host, instanceId, onSaved) {
       <input id="bl-t" class="limit-input" type="number" step="any" placeholder="reference thickness mm" />
       <button type="button" class="btn btn-sm" id="bl-save">Capture &amp; save calibration</button>
     </div>
-    <div id="bl-result" class="hint" style="margin-top:10px"></div>
-    <div class="run-actions" style="margin-top:12px">
-      <button type="button" class="btn secondary btn-sm" id="bl-reset">Reset calibration</button>
-    </div>`;
+    <div id="bl-result" class="hint" style="margin-top:10px"></div>`;
   const $ = (id) => host.querySelector("#" + id);
   let disposed = false;
   let live = null;
@@ -43,7 +40,7 @@ function baselinePanel(host, instanceId, onSaved) {
     $("bl-result").innerHTML = data.calibrated_at
       ? `<span class="badge good">calibrated</span> reference ${esc(data.reference_thickness ?? "—")} mm${esc(ref)}
          <br/>by ${esc(data.calibrated_by || "")} · ${esc(new Date(data.calibrated_at).toLocaleString())}`
-      : `<span class="badge warn">not calibrated</span>${esc(ref)}`;
+      : "";
     if (!prefilled && data.reference_thickness != null && data.calibrated_at) {
       $("bl-t").value = data.reference_thickness;
       prefilled = true;
@@ -83,20 +80,6 @@ function baselinePanel(host, instanceId, onSaved) {
     finally { busy = false; $("bl-save").disabled = false; }
   });
 
-  $("bl-reset").addEventListener("click", async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      await api.resetCalibration(instanceId);
-      $("bl-t").value = "";
-      prefilled = false;
-      toast("Calibration reset");
-      if (onSaved) onSaved(null);
-      await poll();
-    } catch (err) { toast(err.message); }
-    finally { busy = false; }
-  });
-
   return () => { disposed = true; clearInterval(timer); };
 }
 
@@ -127,10 +110,7 @@ function oppositePanel(host, instanceId, onSaved) {
       <div id="op-preview" class="hint"></div>
       <button type="button" class="btn btn-sm" id="op-save-auto" style="margin-top:8px">Capture &amp; save auto-gap</button>
     </div>
-    <div id="op-result" class="hint" style="margin-top:10px"></div>
-    <div class="run-actions" style="margin-top:12px">
-      <button type="button" class="btn secondary btn-sm" id="op-reset">Reset calibration</button>
-    </div>`;
+    <div id="op-result" class="hint" style="margin-top:10px"></div>`;
   const $ = (id) => host.querySelector("#" + id);
   let disposed = false;
   let live = null;
@@ -163,8 +143,9 @@ function oppositePanel(host, instanceId, onSaved) {
         ? ` · object ${fmt(gap.object_thickness)} mm` : ""}${gap.tolerance != null
         ? ` · ±${fmt(gap.tolerance)} mm` : ""}<br/>limits ${range}
          ${data.calibrated_by ? `<br/>by ${esc(data.calibrated_by)} · ${esc(new Date(data.calibrated_at).toLocaleString())}` : ""}`
-      : `<span class="badge warn">not calibrated</span>${data.sensor_count < 2
-        ? " · map both sensor columns to use opposite-side mode" : ""}`;
+      : data.sensor_count < 2
+        ? "Map both sensor columns to use opposite-side mode"
+        : "";
   }
 
   async function poll() {
@@ -231,22 +212,6 @@ function oppositePanel(host, instanceId, onSaved) {
       await poll();
     } catch (err) { toast(err.message); }
     finally { busy = false; $("op-save-auto").disabled = false; }
-  });
-
-  $("op-reset").addEventListener("click", async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      await api.resetCalibration(instanceId);
-      $("op-gap").value = "";
-      $("op-object").value = "";
-      $("op-tol").value = "";
-      $("op-preview").textContent = "";
-      toast("Calibration reset");
-      if (onSaved) onSaved(null);
-      await poll();
-    } catch (err) { toast(err.message); }
-    finally { busy = false; }
   });
 
   return () => { disposed = true; clearInterval(timer); };

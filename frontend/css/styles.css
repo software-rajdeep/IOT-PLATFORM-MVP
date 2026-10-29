@@ -600,6 +600,10 @@ h2 { font-size: 18px; margin: 0 0 4px; }
 .raw-current-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
 .raw-current-item { min-width: 0; }
 .raw-current-item .big { margin-top: 6px; }
+.sensor-trend-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.sensor-trend-item { min-width: 0; }
+.sensor-trend-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.sensor-trend-item .wchart { height: 130px; min-height: 0; }
 .td-r { text-align: right !important; }
 .td-mono { font-family: var(--mono); }
 .td-dim { color: var(--muted); }
@@ -632,3 +636,7 @@ td.wrap { white-space: normal !important; word-break: break-all; max-width: 320p
 .email-status { font-size: 12px; color: var(--muted); }
 .email-status.good { color: var(--good); }
 .email-status.bad { color: var(--bad); }
+
+/* whatsapp alerts */
+.whatsapp-panel { margin-top: 16px; }
+.whatsapp-status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 0; }

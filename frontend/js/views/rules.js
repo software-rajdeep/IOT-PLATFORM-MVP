@@ -8,6 +8,32 @@ const RULES = {
   mapping_failure: { label: "Data cannot be mapped", param: null },
 };
 
+// WhatsApp alert settings are browser-local for now; the delivery backend is
+// not wired up yet. The shape mirrors the email alert config so it can be sent
+// to the API unchanged once the backend exists.
+const WA_DEFAULTS = {
+  enabled: false,
+  recipient_phone: "",
+  template: "ucap_alert",
+  alerts: { fail_streak: true, offline: true, mapping_failure: true },
+  cooldown: { enabled: true, minutes: 5 },
+};
+const WA_STORAGE_KEY = "ucap_whatsapp_alerts";
+
+function loadWhatsAppConfig() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(WA_STORAGE_KEY) || "null") || {};
+    return {
+      ...WA_DEFAULTS,
+      ...saved,
+      alerts: { ...WA_DEFAULTS.alerts, ...(saved.alerts || {}) },
+      cooldown: { ...WA_DEFAULTS.cooldown, ...(saved.cooldown || {}) },
+    };
+  } catch {
+    return { ...WA_DEFAULTS };
+  }
+}
+
 // Step 5 — limits (rendered from the template's input definitions) + alert rules.
 export async function renderRules(view, ctx, setCleanup, instanceId) {
   const [instance, al, email] = await Promise.all([
@@ -22,6 +48,7 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
   const rules = al.rules || {};
   const isAdmin = ["superadmin", "admin"].includes(ctx.session?.user?.role);
   let emailCfg = email;
+  let waCfg = loadWhatsAppConfig();
 
   const emailAuthMarkup = (config) => {
     const googleIcon = `<svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
@@ -104,6 +131,45 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
       ) : `<div class="panel email-panel">
         <h3>Email alerts (Gmail)</h3>
         <p class="hint">Email alert settings require a company administrator.</p>
+      </div>`}
+      ${isAdmin ? `<div class="panel whatsapp-panel">
+        <h3>WhatsApp alerts</h3>
+        <label class="setting-row"><span>Enable WhatsApp alerts</span>
+          <input type="checkbox" class="setting-toggle wa-enabled" ${waCfg.enabled ? "checked" : ""} /></label>
+        <div class="whatsapp-status-row">
+          <span class="email-badge">Not connected</span>
+          <span class="hint">Alerts are delivered with the WhatsApp Business Cloud API.</span>
+        </div>
+        <div class="field">
+          <label for="wa-recipient">Client WhatsApp number</label>
+          <input id="wa-recipient" type="tel" inputmode="tel" value="${esc(waCfg.recipient_phone)}"
+            placeholder="+91 98765 43210" />
+          <p class="hint">Include the country code. The client must opt in to receive alerts.</p>
+        </div>
+        <div class="field">
+          <label for="wa-template">Message template</label>
+          <input id="wa-template" type="text" value="${esc(waCfg.template)}" placeholder="ucap_alert" />
+          <p class="hint">Business-initiated messages require a pre-approved WhatsApp template.</p>
+        </div>
+        <div class="email-rule-list">
+          ${Object.entries(RULES).map(([type, r]) => `<label class="setting-row">
+            <span>WhatsApp on: ${esc(r.label)}</span>
+            <input type="checkbox" class="setting-toggle wa-rule" data-rule="${type}"
+              ${waCfg.alerts?.[type] !== false ? "checked" : ""} /></label>`).join("")}
+        </div>
+        <div class="field">
+          <label for="wa-cooldown">Cooldown (minutes)</label>
+          <input id="wa-cooldown" type="number" min="1" max="1440"
+            value="${esc(waCfg.cooldown?.minutes ?? 5)}" />
+        </div>
+        <div class="email-actions">
+          <button class="btn secondary btn-sm" id="wasave" type="button">Save WhatsApp settings</button>
+          <button class="btn secondary btn-sm" id="watest" type="button">Send test message</button>
+          <span class="email-status" id="wa-status"></span>
+        </div>
+      </div>` : `<div class="panel whatsapp-panel">
+        <h3>WhatsApp alerts</h3>
+        <p class="hint">WhatsApp alert settings require a company administrator.</p>
       </div>`}
       <button class="btn" id="next">Continue to graphs →</button>
     </div>`;
@@ -192,6 +258,44 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
     if (btn) btn.addEventListener("click", () => connectGoogle().catch((e) => toast(e.message)));
   }
 
+  function setWaStatus(text, cls) {
+    const el = document.getElementById("wa-status");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "email-status" + (cls ? ` ${cls}` : "");
+  }
+
+  function collectWaConfig() {
+    const alerts = {};
+    view.querySelectorAll(".wa-rule").forEach((el) => {
+      alerts[el.dataset.rule] = el.checked;
+    });
+    const minutes = Number(document.getElementById("wa-cooldown")?.value);
+    return {
+      enabled: document.querySelector(".wa-enabled")?.checked || false,
+      recipient_phone: document.getElementById("wa-recipient")?.value.trim() || "",
+      template: document.getElementById("wa-template")?.value.trim() || "",
+      alerts,
+      cooldown: { enabled: true, minutes: Number.isFinite(minutes) ? minutes : 5 },
+    };
+  }
+
+  function saveWhatsApp(quiet) {
+    waCfg = collectWaConfig();
+    localStorage.setItem(WA_STORAGE_KEY, JSON.stringify(waCfg));
+    if (!quiet) setWaStatus("Saved on this device. Delivery is not connected yet.", "good");
+  }
+
+  function testWhatsApp() {
+    const cfg = collectWaConfig();
+    if (!cfg.recipient_phone) {
+      setWaStatus("Enter a WhatsApp number first.", "bad");
+      return;
+    }
+    saveWhatsApp(true);
+    setWaStatus("WhatsApp delivery is not connected on the backend yet.", "bad");
+  }
+
   async function saveLimits(quiet) {
     const config = {};
     view.querySelectorAll("[data-key]").forEach((el) => {
@@ -229,11 +333,16 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
     document.getElementById("etest").addEventListener("click", () => testEmail());
     bindEmailAuth();
   }
+  if (isAdmin) {
+    document.getElementById("wasave").addEventListener("click", () => saveWhatsApp());
+    document.getElementById("watest").addEventListener("click", () => testWhatsApp());
+  }
   document.getElementById("next").addEventListener("click", async () => {
     try {
       if (!(await saveLimits(true))) return;
       await saveRules(true);
       if (isAdmin && emailCfg) await saveEmail(true);
+      if (isAdmin) saveWhatsApp(true);
       ctx.navigate(`#/setup/${instanceId}/graphs`);
     } catch (e) { toast(e.message); }
   });

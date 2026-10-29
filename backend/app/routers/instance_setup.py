@@ -84,6 +84,9 @@ def capture_samples(instance_id: str, user: dict = Depends(get_current_user)) ->
             connector = cls(connector_config(device), {"centre_distance": device.get("centre_distance")})
             if connector.simulate:
                 payload = {"measurement_raw": connector.readMeasurement().get("measurement_raw")}
+            elif getattr(connector, "replay", False) and hasattr(connector, "read_replay_payload"):
+                result = connector.read_replay_payload(None)
+                payload = result[0] if result else None
             elif hasattr(connector, "read_payload"):
                 payload = connector.read_payload()
             else:

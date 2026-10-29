@@ -146,4 +146,15 @@ export const api = {
   history: (id) => request(`/instances/${id}/history`),
   clone: (id, data) => request(`/instances/${id}/clone`, { method: "POST", body: data }),
   exportCsv: (id, params) => request(`/instances/${id}/export.csv?` + new URLSearchParams(params), { raw: true }),
+
+  // AI assistant (server-side provider keys; tenant derived from the token)
+  aiChat: ({ message, machine_id, conversation_id }) =>
+    request("/ai/chat", {
+      method: "POST",
+      body: {
+        message,
+        machine_id: machine_id || null,
+        conversation_id: conversation_id || null,
+      },
+    }),
 };

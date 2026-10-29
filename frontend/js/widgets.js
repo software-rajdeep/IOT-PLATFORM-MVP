@@ -21,6 +21,8 @@ export const DEFAULT_TITLES = {
   alerts_list: () => "Alerts",
   history_table: () => "Reading history",
   sensor_list: () => "Sensor readings",
+  sensor_thickness: () => "Per-sensor thickness",
+  sensor_trends: (d) => `${d.label} per sensor`,
   raw_readings: () => "Raw readings",
   raw_current: () => "Current raw sensor readings",
 };
@@ -120,17 +122,11 @@ export function renderWidget(type, d, state = {}) {
   const u = esc(d.unit || "");
   switch (type) {
     case "current_value":
-      return `<div class="big ${cls(c.status)}">${fmt(c.value)}<span class="u">${u}</span></div>
-        <div class="stat-sub"><span class="badge ${cls(c.status)}">${esc(c.status || "—")}</span> · ${esc(shortTime(c.ts))}
-        ${c.group ? ` · <span class="tag">${esc(c.group)}</span>` : ""}${c.speed != null ? ` · ${fmt(c.speed, 1)} m/min` : ""}</div>`;
+      return `<div class="big ${cls(c.status)}">${fmt(c.value)}<span class="u">${u}</span></div>`;
     case "target_deviation":
-      return `<div class="big">${fmt(cfg.target)}<span class="u">${u}</span></div>
-        <div class="stat-sub">deviation ${c.deviation == null ? "—" : (c.deviation > 0 ? "+" : "") + fmt(c.deviation)} ${u}
-        · band ${fmt(cfg.lower)} – ${fmt(cfg.upper)}</div>`;
+      return `<div class="big">${fmt(cfg.target)}<span class="u">${u}</span></div>`;
     case "pass_fail":
-      return `<div class="pf">${donut(q.pass_percentage)}<div class="stat-sub">
-        <span class="badge good">${q.pass_count || 0} pass</span><br/><span class="badge bad">${q.fail_count || 0} fail</span>
-        <br/>last ${s.samples || 0} readings</div></div>`;
+      return `<div class="pf">${donut(q.pass_percentage)}</div>`;
     case "statistics":
       return `<div class="kv"><span>avg</span><b>${fmt(s.average)}</b><span>min</span><b>${fmt(s.minimum)}</b>
         <span>max</span><b>${fmt(s.maximum)}</b><span>std dev</span><b>${fmt(s.std_dev, 4)}</b>
@@ -163,11 +159,7 @@ export function renderWidget(type, d, state = {}) {
         </tbody></table>` : `<div class="empty">no product codes yet</div>`;
     case "device_health": {
       const h = d.device_health || {};
-      const on = h.communication === "ONLINE";
-      return `<div class="big" style="font-size:16px">${esc(h.model || h.device_id || "—")}</div>
-        <div class="stat-sub"><span class="badge ${on ? "good" : "bad"}">${esc(h.communication || "—")}</span>
-        · ${h.seconds_since == null ? "no data" : h.seconds_since + " s ago"} · ${esc((h.interface || "").toLowerCase())}</div>
-        ${h.last_error ? `<div class="stat-sub bad">${esc(h.last_error)}</div>` : ""}`;
+      return `<div class="big" style="font-size:16px">${esc(h.model || h.device_id || "—")}</div>`;
     }
     case "calibration_status": {
       const done = !!cfg["calibration.calibrated_at"];
@@ -236,6 +228,34 @@ export function renderWidget(type, d, state = {}) {
             ${computed ? `<td class="td-r td-mono ${s.status === "FAIL" ? "bad" : ""}">${fmt(value)}</td>` : ""}</tr>`;
         }).join("")}
         </tbody></table>` : `<div class="empty">one sensor — add more in Setup › Map</div>`;
+    }
+    case "sensor_thickness": {
+      const list = d.sensors || [];
+      if (!list.length) return `<div class="empty">one sensor — add more in Setup › Map</div>`;
+      return `<div class="raw-current-grid">${list.map((s) => {
+        const value = s.is_reference ? s.error : s.thickness;
+        const shown = value != null ? value : (s.distance != null ? s.distance : s.value);
+        return `<div class="raw-current-item">
+          <div class="stat-sub">${esc(s.label || s.key)}</div>
+          <div class="big ${cls(s.status)}">${fmt(shown)}<span class="u">${u}</span></div>
+          <div class="stat-sub">${s.is_reference ? "error" : "thickness"}</div>
+        </div>`;
+      }).join("")}</div>`;
+    }
+    case "sensor_trends": {
+      const list = d.sensors || [];
+      if (!list.length) return `<div class="empty">one sensor — add more in Setup › Map</div>`;
+      const refs = [{ v: cfg.lower, color: "var(--bad)" }, { v: cfg.target, color: "var(--muted)" },
+        { v: cfg.upper, color: "var(--bad)" }];
+      return `<div class="sensor-trend-grid">${list.map((s) => {
+        const series = (s.thickness_series && s.thickness_series.length) ? s.thickness_series : s.series;
+        const latest = s.thickness != null ? s.thickness : (s.distance != null ? s.distance : s.value);
+        return `<div class="sensor-trend-item">
+          <div class="sensor-trend-head"><span>${esc(s.label || s.key)}</span>
+            <span class="td-mono ${cls(s.status)}">${fmt(latest)} ${u}</span></div>
+          ${lineChart(series || [], "value", refs, 130)}
+        </div>`;
+      }).join("")}</div>`;
     }
     case "raw_readings": {
       const list = d.sensors || [];

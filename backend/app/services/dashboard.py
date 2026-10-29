@@ -79,6 +79,50 @@ def get_layout(instance_id: str, template: dict, config: Optional[dict] = None) 
     return layout
 
 
+def _sensor_thickness_series(processor_key: str, config: dict, keys: list[str],
+                             per_key: dict, ref_key: Optional[str]) -> dict:
+    """Per-sensor thickness trend for side-by-side baseline calibration.
+
+    Mirrors ``processors.side_by_side_thickness`` so each sensor graph uses the
+    same ``reference + (baseline - current) + reference drift`` formula as the
+    live per-sensor values. Other processors keep raw series only.
+    """
+    if processor_key != "sbs_thickness":
+        return {}
+    mode = str((config or {}).get("calibration.mode") or "auto").strip().lower()
+    baselines = parse_baselines(config)
+    if mode == "linear" or not baselines:
+        return {}
+    reference_thickness = _num((config or {}).get("calibration.reference_thickness")) or 0.0
+    ref_base = baselines.get(ref_key) if ref_key else None
+    ref_values: dict[str, float] = {}
+    if ref_key:
+        for point in per_key.get(ref_key, []):
+            if point["value"] is not None:
+                ref_values[point["ts"]] = point["value"]
+    out: dict[str, list] = {}
+    for key in keys:
+        if key == ref_key:
+            continue
+        baseline = baselines.get(key)
+        if baseline is None:
+            continue
+        series = []
+        for point in per_key.get(key, []):
+            value = point["value"]
+            if value is None:
+                continue
+            drift = 0.0
+            if ref_key and ref_base is not None:
+                ref_value = ref_values.get(point["ts"])
+                if ref_value is not None:
+                    drift = ref_value - ref_base
+            series.append({"ts": point["ts"],
+                           "value": round(reference_thickness + (baseline - value) + drift, 6)})
+        out[key] = series
+    return out
+
+
 def _health(device: dict) -> dict:
     age = _secs_since(device.get("last_seen"))
     # A replay source walks historical rows, so its next reading can be a few
@@ -242,6 +286,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             f = _json(r["fields"], {})
             for k in keys:
                 per_key[k].append({"ts": r["ts"].isoformat(), "value": _num(f.get(k))})
+        thickness_series = _sensor_thickness_series(processor_key, config, keys, per_key, ref_key)
         sensors = []
         for i, k in enumerate(keys):
             suffix = k[len(input_key):] if k.startswith(input_key) else ""
@@ -261,6 +306,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
                 "error": _num(latest_fields.get("reference.error_mm")) if k == ref_key else None,
                 "is_reference": k == ref_key,
                 "series": per_key[k],
+                "thickness_series": thickness_series.get(k),
             })
 
     limit_keys = {k: roles.get(k) for k in ("target", "lower", "upper")}

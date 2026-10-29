@@ -39,7 +39,7 @@ export async function renderConnection(view, ctx, setCleanup) {
             <h3>Data source</h3>
             <div class="source-grid">${SOURCES.map((s) => `
               <button type="button" class="source-card ${s.key === source ? "selected" : ""}" data-src="${s.key}">
-                <b>${esc(s.title)}</b><span>${esc(s.sub)}</span></button>`).join("")}</div>
+                <b>${esc(s.title)}</b></button>`).join("")}</div>
 
             <div id="src-gateway" class="src-fields">
               <div class="grid cols-2" style="gap:10px">
@@ -302,7 +302,8 @@ export async function renderConnection(view, ctx, setCleanup) {
           order_by: $("api-order").value || null } });
     } else if (source === "db") {
       Object.assign(conn, { interface: "database_api", simulate: false, poll_interval_ms: parseInt($("db-poll").value, 10) || 1000,
-        database: { ...dbConnection(), table: $("db-table").value || null, order_by: $("db-order").value || null } });
+        database: { ...dbConnection(), table: $("db-table").value || null, order_by: $("db-order").value || null,
+          replay: replayConfig() } });
     } else {
       Object.assign(conn, { interface: "http_push", simulate: false });
     }

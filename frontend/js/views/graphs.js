@@ -22,7 +22,7 @@ export async function renderGraphs(view, ctx, setCleanup, instanceId, mode = "se
         <aside class="panel lib">
           <h3>Available · ${available.length}</h3>
           ${available.map((w) => `<button class="lib-item" data-add="${esc(w.widget_type)}" title="${esc(w.description || "")}">
-            <b>${esc(w.name)}</b><span>${esc(w.description || "")}</span><i>+</i></button>`).join("")}
+            <b>${esc(w.name)}</b><i>+</i></button>`).join("")}
           ${locked.length ? `<h3 style="margin-top:16px">Locked · ${locked.length}</h3>
           ${locked.map((w) => `<a class="lib-item locked" href="#/setup/${esc(instanceId)}/map">
             <b>${esc(w.name)}</b><span>Map <u>${esc(w.unlock_with.join(", "))}</u> to unlock</span><i>🔒</i></a>`).join("")}` : ""}

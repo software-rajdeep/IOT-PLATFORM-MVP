@@ -15,6 +15,7 @@ import { renderRules } from "./views/rules.js";
 import { renderGraphs } from "./views/graphs.js";
 import { renderActivate } from "./views/activate.js";
 import { renderHistory, renderReport } from "./views/report.js";
+import { resetAssistant, setAssistantMachine, setAssistantVisible } from "./ai-assistant.js";
 
 const SETUP_STEPS = {
   map: renderMapping, commission: renderCommission, rules: renderRules,
@@ -44,6 +45,13 @@ function navLink(hash, label, active) {
   return `<a href="${hash}" class="${active ? "active" : ""}">${label}</a>`;
 }
 
+// The assistant uses the same machine/application the user is currently viewing.
+function assistantMachineFromHash() {
+  const parts = location.hash.replace(/^#/, "").split("/").filter(Boolean);
+  return ["app", "setup", "report", "history", "calibrate", "limits"].includes(parts[0])
+    ? (parts[1] || null) : null;
+}
+
 function renderShell(authenticated, session, activePath) {
   if (!authenticated) {
     app.innerHTML = `<div id="view"></div>`;
@@ -69,6 +77,8 @@ function renderShell(authenticated, session, activePath) {
     </header>
     <div id="view"></div>`;
   document.getElementById("signout").addEventListener("click", () => {
+    resetAssistant();
+    setAssistantVisible(false);
     store.clearSession();
     store.clearSelection();
     navigate("#/catalog");
@@ -82,6 +92,7 @@ async function route() {
 
   if (!store.token()) {
     setCleanup(null);
+    setAssistantVisible(false);
     renderShell(false);
     renderLogin(document.getElementById("view"), ctx);
     return;
@@ -95,6 +106,7 @@ async function route() {
       sessionStorage.setItem("ucap_session", JSON.stringify(session));
     } catch {
       store.clearSession();
+      setAssistantVisible(false);
       renderShell(false);
       renderLogin(document.getElementById("view"), ctx);
       return;
@@ -102,6 +114,8 @@ async function route() {
   }
 
   setCleanup(null);
+  setAssistantVisible(true);
+  setAssistantMachine(assistantMachineFromHash());
   renderShell(true, session, activePath);
   const view = document.getElementById("view");
   view.innerHTML = `<div class="spinner">loading…</div>`;

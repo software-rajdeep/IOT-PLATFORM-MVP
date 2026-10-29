@@ -8,8 +8,7 @@ export async function renderApplications(view, ctx, setCleanup) {
     <div class="page">
       <div class="crumbs"><b>My applications</b></div>
       <h1>My applications</h1>
-      <p class="lead">Every configured solution: product, application, data source and dashboard.
-        <a href="#/catalog">+ New solution</a></p>
+      <p class="lead"><a href="#/catalog">+ New solution</a></p>
       <div id="list"><div class="spinner">loading…</div></div>
     </div>`;
 
@@ -26,12 +25,6 @@ export async function renderApplications(view, ctx, setCleanup) {
         <span class="num">${esc(i.status)}</span>
         <h3>${esc(i.name)}</h3>
         <p>${esc((i.template && i.template.name) || "")} · device ${esc(i.device_id || "—")}</p>
-        <div class="tagrow">
-          <span class="tag accent">${esc((i.template && i.template.template_id) || "")}</span>
-          ${i.plant ? `<span class="tag">${esc(i.plant)}</span>` : ""}
-          <span class="tag ${i.steps && i.steps.active ? "accent" : ""}">${i.steps && i.steps.active ? "live" : "setup"}</span>
-          ${i.interface ? `<span class="tag">${esc(String(i.interface).replace("database_api", "customer data").replace("http_push", "http push").toLowerCase())}</span>` : ""}
-        </div>
       </div>`).join("")}</div>`;
 
     host.querySelectorAll(".card").forEach((card) => {

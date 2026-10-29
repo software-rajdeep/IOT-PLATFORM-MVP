@@ -14,7 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
-from .routers import auth, catalog, demo_customer, devices, email_alerts, gateway, instance_setup, instances, meta
+from .routers import (
+    ai, auth, catalog, demo_customer, devices, email_alerts, events, gateway,
+    instance_setup, instances, meta, whatsapp,
+)
 from .services.dashboard import invalidate_dashboards
 
 
@@ -24,14 +27,17 @@ async def lifespan(app: FastAPI):
         print("[security] AUTH_SECRET is the development default; set a real secret before any deployment.")
     from . import simulator
     from .routers import demo_customer as demo
+    from .services.ai_assistant import worker as ai_worker
 
     if settings.enable_poller:
         simulator.start()
     if settings.enable_demo_customer:
         demo.start_feeder()
+    ai_worker.start()
     yield
     simulator.stop()
     demo.stop_feeder()
+    ai_worker.stop()
 
 
 app = FastAPI(
@@ -68,7 +74,8 @@ async def static_cache_policy(request, call_next):
         response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
     return response
 
-for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer, email_alerts):
+for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer,
+               email_alerts, events, ai, whatsapp):
     app.include_router(module.router)
 app.include_router(gateway.push_router)
 app.include_router(email_alerts.legacy_router)

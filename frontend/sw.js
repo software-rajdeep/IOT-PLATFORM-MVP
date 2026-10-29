@@ -1,7 +1,7 @@
 // Service worker: cache the static SPA shell so repeat page loads are instant.
 // API responses are never cached (live data must always be fresh).
 // Bump VERSION whenever the static file list changes to force a clean precache.
-const VERSION = "ucap-v3";
+const VERSION = "ucap-v4";
 const STATIC_CACHE = `ucap-static-${VERSION}`;
 const SHELL_CACHE = `ucap-shell-${VERSION}`;
 
@@ -9,9 +9,11 @@ const PRECACHE = [
   "/",
   "/index.html",
   "/css/styles.css",
+  "/css/assistant.css",
   "/vendor/gridstack.min.css",
   "/vendor/gridstack-all.js",
   "/js/app.js",
+  "/js/ai-assistant.js",
   "/js/api.js",
   "/js/store.js",
   "/js/ui.js",

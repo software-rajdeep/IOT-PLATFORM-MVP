@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI assistant UI test</title>
+  <link rel="stylesheet" href="/css/styles.css" />
+  <link rel="stylesheet" href="/css/assistant.css" />
+  <style>body { font-family: sans-serif; } #out { white-space: pre-wrap; }</style>
+</head>
+<body>
+  <div id="app"></div>
+  <pre id="out">running…</pre>
+  <script type="module">
+    const out = document.getElementById("out");
+    const checks = [];
+    const calls = [];
+    let mode = "success";
+    let chatCount = 0;
+    const conversationId = "11111111-1111-4111-8111-111111111111";
+
+    localStorage.setItem("ucap_token", "test-token");
+
+    function ok(name, condition, detail = "") {
+      checks.push({ name, pass: Boolean(condition), detail });
+    }
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    window.fetch = async (url, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : null;
+      calls.push({ url, body, auth: (opts.headers && opts.headers.Authorization) || "" });
+      if (!String(url).includes("/api/v1/ai/chat")) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (mode === "network") throw new TypeError("Failed to fetch");
+      if (mode === "unauthorized") {
+        return new Response(JSON.stringify({ detail: "Not authenticated" }), {
+          status: 401, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (mode === "empty") {
+        return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      chatCount += 1;
+      const first = {
+        message: "Average thickness today was 8.50 mm.",
+        conversation_id: conversationId,
+        source: "ai",
+        time_range: {
+          label: "today",
+          start_local: "2026-10-29T00:00:00+05:30",
+          end_local: "2026-10-29T12:00:00+05:30",
+          timezone: "Asia/Kolkata",
+        },
+        units: { thickness: "mm" },
+        data_sources: ["metrics.measurements"],
+        data: {
+          source: "metrics.measurements",
+          machine: { machine_id: "THICKNESS001", name: "Line A", asset_id: "LINE_A" },
+          metric: "thickness",
+          units: { thickness: "mm" },
+          statistics: {
+            samples: 120, values_count: 120, average: 8.5, minimum: 8.1, maximum: 8.9,
+            std_dev: 0.12, pass_count: 118, fail_count: 2, pass_percentage: 98.33,
+          },
+          has_data: true,
+          limits: { lower: 8, upper: 9, active: true },
+          target: 8.5,
+        },
+      };
+      const second = {
+        answer: "Yesterday the average was 8.42 mm.",
+        conversation_id: conversationId,
+        citations: [
+          { type: "instance", instance_id: "THICKNESS001", name: "Line A" },
+          { type: "timestamp", ts: "2026-10-28T18:00:00Z" },
+        ],
+      };
+      const payload = chatCount === 1 ? first : second;
+      return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+
+    try {
+      const assistant = await import("/js/ai-assistant.js");
+      assistant.setAssistantVisible(true);
+      assistant.setAssistantMachine("THICKNESS001");
+
+      const fab = document.getElementById("ai-fab");
+      const panel = document.getElementById("ai-panel");
+      const input = document.getElementById("ai-input");
+      const send = document.getElementById("ai-send");
+      const log = document.getElementById("ai-log");
+
+      ok("FAB is visible", !document.getElementById("ai-root").hidden);
+      ok("Panel starts closed", panel.hidden && fab.getAttribute("aria-expanded") === "false");
+
+      fab.click();
+      await sleep(20);
+      ok("Panel opens", !panel.hidden && fab.getAttribute("aria-expanded") === "true");
+      ok("Suggested questions render", log.textContent.includes("Summarise today for this machine."));
+      ok("Machine context shown", document.getElementById("ai-context").textContent.includes("THICKNESS001"));
+
+      input.value = "What is the average thickness today?";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      send.click();
+      await sleep(80);
+      const firstText = log.textContent;
+      ok("User question rendered", firstText.includes("What is the average thickness today?"));
+      ok("Assistant answer rendered", firstText.includes("Average thickness today was 8.50 mm."));
+      ok("Statistics card rendered", firstText.includes("Measurement statistics") && firstText.includes("8.5"));
+      ok("Units rendered", firstText.includes("mm"));
+      ok("Source rendered", firstText.includes("Processed measurements"));
+      ok("Time range rendered", firstText.includes("today") && firstText.includes("Asia/Kolkata"));
+      ok("Timestamp rendered", Boolean(log.querySelector("time.ai-time")));
+      ok("Bearer token sent", calls[0].auth === "Bearer test-token");
+      ok("Machine context sent", calls[0].body.machine_id === "THICKNESS001");
+      ok("First conversation starts fresh", calls[0].body.conversation_id === null);
+
+      input.value = "And yesterday?";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      send.click();
+      await sleep(80);
+      ok("Follow-up answer rendered", log.textContent.includes("Yesterday the average was 8.42 mm."));
+      ok("Follow-up reuses conversation id", calls[1].body.conversation_id === conversationId);
+
+      panel.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(10);
+      ok("Escape closes panel", panel.hidden && fab.getAttribute("aria-expanded") === "false");
+      fab.click();
+      await sleep(10);
+      ok("Keyboard-open panel is visible again", !panel.hidden);
+      ok("Focus moves into the composer", document.activeElement === input);
+
+      mode = "network";
+      input.value = "Any readings?";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      send.click();
+      await sleep(80);
+      ok("Network error handled", log.textContent.includes("couldn't reach the server"));
+      const retry = log.querySelector("[data-ai-retry]");
+      ok("Retry action offered", Boolean(retry));
+      if (retry) {
+        mode = "success";
+        retry.click();
+        await sleep(80);
+        ok("Retry recovers", log.textContent.includes("Yesterday the average was 8.42 mm.") || log.textContent.includes("Average thickness today was 8.50 mm."));
+      }
+
+      mode = "empty";
+      input.value = "Empty test";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      send.click();
+      await sleep(80);
+      ok("Empty response handled", log.textContent.includes("returned an empty response"));
+
+      mode = "empty";
+      assistant.setAssistantVisible(false);
+      localStorage.setItem("ucap_token", "test-token");
+      document.getElementById("ai-root").hidden = true;
+      assistant.setAssistantVisible(true);
+      fab.click();
+      await sleep(10);
+
+      mode = "unauthorized";
+      input.value = "Unauthorized test";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      send.click();
+      await sleep(80);
+      ok("Unauthorized error handled", log.textContent.includes("session expired"));
+      ok("Sign-in action offered", Boolean(log.querySelector("[data-ai-signin]")));
+      ok("Token cleared by 401", localStorage.getItem("ucap_token") === null);
+
+      const rect = panel.getBoundingClientRect();
+      const summary = {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        panel: { width: Math.round(rect.width), height: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
+        panelPosition: getComputedStyle(panel).position,
+        checks,
+        passed: checks.filter((item) => item.pass).length,
+        failed: checks.filter((item) => !item.pass).length,
+      };
+      out.textContent = JSON.stringify(summary, null, 2);
+    } catch (error) {
+      out.textContent = JSON.stringify({ fatal: String(error && error.stack || error) }, null, 2);
+    }
+  </script>
+</body>
+</html>

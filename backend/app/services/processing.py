@@ -18,7 +18,7 @@ from typing import Optional
 
 from ..db import execute, execute_returning, fetch_all
 from ..processors import get_processor
-from . import alerts, filters
+from . import alerts, filters, incidents
 from .devices import load_device
 from .instances import instances_for_device, load_config
 from .mapping import map_payload
@@ -111,21 +111,39 @@ def ingest_raw(device_id: str, payload: dict, source_ts=None) -> dict:
         outputs = processor(config, values)
         fields = {**values, **outputs}
         ts = _ts(context.get("timestamp")) or _ts(source_ts) or received
-        execute(
+        measurement = execute_returning(
             """
             INSERT INTO metrics.measurements
                 (company_id, instance_id, device_id, ts, raw_displacement_mm, displacement_value_mm,
                  thickness_mm, deviation_mm, quality_status, fields, mapping_id, raw_message_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING measurement_id
             """,
             (company_id, instance_id, device_id, ts, values.get("displacement.value_mm"),
              values.get("displacement.value_mm"), outputs.get("thickness.actual_mm"),
              outputs.get("thickness.deviation_mm"), outputs.get("quality.status"),
              json.dumps(fields, default=str), mapping_id, raw_id),
         )
+        measurement_id = measurement["measurement_id"] if measurement else None
         if binding.get("status") == "active":
             alerts.on_measurement(company_id, instance_id, device_id, outputs.get("quality.status"), rule_set)
         live_updates.publish(instance_id, device_id, ts.isoformat())
+        if binding.get("status") == "active":
+            try:
+                incidents.observe(
+                    company_id=company_id,
+                    instance_id=instance_id,
+                    device_id=device_id,
+                    machine_id=device.get("asset_id") or instance_id,
+                    ts=ts,
+                    fields=fields,
+                    config=config,
+                    template=template,
+                    measurement_id=measurement_id,
+                )
+            except Exception as exc:
+                # Event detection must never interrupt acquisition/processing.
+                print(f"[events] incident processing error for {instance_id}/{device_id}: {exc}")
         results.append({"instance_id": instance_id, **fields})
 
     return {"device_id": device_id, "raw_message_id": raw_id, "results": results}

@@ -26,7 +26,7 @@ from typing import Optional
 from .config import settings
 from .db import execute, fetch_all
 from .drivers import get_driver_class
-from .services import alerts
+from .services import alerts, incidents
 from .services.devices import connector_config, connector_driver_key, load_device
 from .services.instances import instances_for_device, load_config
 from .services.processing import ingest_raw
@@ -167,6 +167,10 @@ def _check_offline() -> None:
         alerts.check_offline()
     except Exception as exc:
         print(f"[sources] offline check error: {exc}")
+    try:
+        incidents.check_connectivity()
+    except Exception as exc:
+        print(f"[sources] connectivity incident check error: {exc}")
     finally:
         _offline_in_flight = False
 

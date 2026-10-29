@@ -5,6 +5,14 @@ param([switch]$Reset)
 $ErrorActionPreference = "Stop"
 $backend = Join-Path $PSScriptRoot "backend"
 
+$port = 8000
+$envFile = Join-Path $backend ".env"
+if (Test-Path $envFile) {
+    foreach ($line in Get-Content $envFile) {
+        if ($line -match '^\s*APP_PORT\s*=\s*(\d+)') { $port = [int]$Matches[1]; break }
+    }
+}
+
 Push-Location $backend
 try {
     if ($Reset) {
@@ -14,8 +22,8 @@ try {
     }
     Write-Host "Applying schema + seed ..."
     python scripts/init_db.py
-    Write-Host "Starting API on http://127.0.0.1:8000 ..."
-    python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+    Write-Host "Starting API on http://127.0.0.1:$port ..."
+    python -m uvicorn app.main:app --host 127.0.0.1 --port $port
 }
 finally {
     Pop-Location
