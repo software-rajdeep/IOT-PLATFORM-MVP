@@ -484,6 +484,27 @@ class DatabaseApiConnector(DeviceDriver):
     def _looks_like_jwt(token: str) -> bool:
         return bool(token) and token.startswith("eyJ") and token.count(".") == 2
 
+    @classmethod
+    def _jwt_from_response(cls, response) -> Optional[str]:
+        """Read a JWT from ``set-auth-jwt`` or a ``{"token": "..."}`` body.
+
+        Neon Auth returns the short-lived JWT from ``/token`` in the JSON body;
+        older Better Auth builds put it in the ``set-auth-jwt`` response header.
+        """
+        header = response.headers.get("set-auth-jwt")
+        body = response.read()
+        if header:
+            return header
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if isinstance(data, dict):
+            for value in (data.get("token"), (data.get("session") or {}).get("token")):
+                if isinstance(value, str) and cls._looks_like_jwt(value):
+                    return value
+        return None
+
     @staticmethod
     def _neon_auth_urls(api_url: Optional[str]) -> list:
         """Neon Auth URLs implied by a Neon Data API URL (`.apirest.` -> `.neonauth.`)."""
@@ -522,42 +543,65 @@ class DatabaseApiConnector(DeviceDriver):
         origin = self._auth_origin()
         first_error: Optional[Exception] = None
         session_token = self.api_key or ""
-        if "=" in session_token:
+        if "=" in session_token and session_token.count(".") <= 2:
             name, value = session_token.split("=", 1)
-            if name.startswith(("__Secure-", "better-auth", "neon-auth")):
+            if name.startswith(("__Secure-", "better-auth", "neon-auth", "neonauth")):
                 session_token = value
-        for cookie_name in (
+        # Managed Better Auth (Neon) names its cookie `__Secure-neonauth.session_token`;
+        # older/self-hosted Better Auth deployments use the other names. Send them all
+        # in one request so a token refresh never trips the auth rate limit.
+        cookie_names = (
+            "__Secure-neonauth.session_token",
+            "neonauth.session_token",
             "__Secure-neon-auth.session_token",
             "neon-auth.session_token",
             "better-auth.session_token",
             "__Secure-better-auth.session_token",
-        ):
-            headers = {
-                "Accept": "application/json",
-                "Origin": origin,
-                "Cookie": f"{cookie_name}={session_token}",
-            }
-            req = urllib.request.Request(auth_url + "/get-session", headers=headers, method="GET")
+        )
+        headers = {
+            "Accept": "application/json",
+            "Origin": origin,
+            "Cookie": "; ".join(f"{name}={session_token}" for name in cookie_names),
+        }
+        # Neon Auth mints the Data API JWT at /token; /get-session is the fallback
+        # for deployments that only expose the set-auth-jwt header.
+        for path in ("/token", "/get-session"):
+            req = urllib.request.Request(auth_url + path, headers=headers, method="GET")
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:  # noqa: S310
-                    token = response.headers.get("set-auth-jwt")
-                    response.read()
-                    if token:
-                        self._jwt = token
-                        self._jwt_expires_at = self._jwt_expiry(token) or (time.time() + 300)
-                        return token
+                    token = self._jwt_from_response(response)
             except urllib.error.HTTPError as exc:
-                first_error = exc
+                first_error = first_error or exc
                 try:
                     exc.read()
                 except Exception:
                     pass
+                continue
             except Exception as exc:
-                first_error = exc
-        message = "Auth service did not accept the API key (session token)."
+                first_error = first_error or exc
+                continue
+            if token:
+                self._jwt = token
+                self._jwt_expires_at = self._jwt_expiry(token) or (time.time() + 300)
+                return token
         if isinstance(first_error, urllib.error.HTTPError):
-            message = f"{message} HTTP {first_error.code}."
-        raise DriverError(message) from first_error
+            if first_error.code == 429:
+                raise DriverError(
+                    "Auth service rate-limited the token refresh (HTTP 429). "
+                    "Retry shortly, or paste a short-lived JWT as the API key."
+                ) from first_error
+            if first_error.code in (401, 403):
+                raise DriverError(
+                    "Auth service rejected the API key (session token) "
+                    f"(HTTP {first_error.code}). Paste a fresh session token or a JWT."
+                ) from first_error
+            raise DriverError(
+                f"Auth service did not accept the API key (session token). HTTP {first_error.code}."
+            ) from first_error
+        raise DriverError(
+            "Auth service found no session for this API key. Paste a session token from the "
+            "same Neon Auth project, or a short-lived JWT instead."
+        )
 
     def _refresh_jwt(self) -> str:
         """Sign in to the auth service and return a fresh JWT bearer token."""
@@ -582,9 +626,7 @@ class DatabaseApiConnector(DeviceDriver):
             )
             try:
                 with opener.open(req, timeout=self.timeout) as response:  # noqa: S310
-                    token = response.headers.get("set-auth-jwt")
-                    response.read()
-                    return token
+                    return self._jwt_from_response(response)
             except urllib.error.HTTPError as exc:
                 detail = ""
                 try:
@@ -597,11 +639,15 @@ class DatabaseApiConnector(DeviceDriver):
                 raise DriverError(f"Auth sign-in failed: {exc}") from exc
 
         payload = json.dumps({"email": self.auth_email, "password": self.auth_password}).encode()
+        # sign-in sets the session cookie; /token then returns the Data API JWT
+        # (the sign-in body's own `token` is the session token, not a JWT).
         token = request("/sign-in/email", payload)
+        if not token:
+            token = request("/token")
         if not token:
             token = request("/get-session")
         if not token:
-            raise DriverError("Auth service did not return a JWT (set-auth-jwt).")
+            raise DriverError("Auth service did not return a JWT (set-auth-jwt or /token).")
         self._jwt = token
         self._jwt_expires_at = self._jwt_expiry(token) or (time.time() + 300)
         return token

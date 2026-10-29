@@ -232,7 +232,7 @@ def test_postgrest_discovery_surfaces_the_auth_error(monkeypatch):
 
 def _jwt(exp: float) -> str:
     payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
-    return f"header.{payload}.signature"
+    return f"eyJheader.{payload}.signature"
 
 
 def test_jwt_refresh_signs_in_and_caches_the_token(monkeypatch):
@@ -281,7 +281,9 @@ def test_session_token_api_key_is_exchanged_for_a_jwt(monkeypatch):
 
     def fake_urlopen(req, timeout=None):  # noqa: ARG001
         calls.append({"url": req.full_url, "headers": {k.lower(): v for k, v in req.header_items()}})
-        return _FakeResponse(b'{"session":{}}', headers={"set-auth-jwt": token})
+        # Neon Auth returns the Data API JWT from /token in the JSON body.
+        body = b'{"token":"%s"}' % token.encode() if req.full_url.endswith("/token") else b'{"session":{}}'
+        return _FakeResponse(body)
 
     monkeypatch.setattr("app.services.source_guard.check_url", lambda url: None)  # noqa: ARG005
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -295,8 +297,8 @@ def test_session_token_api_key_is_exchanged_for_a_jwt(monkeypatch):
     })
 
     assert driver._credential() == token
-    assert calls[0]["url"].endswith("/get-session")
-    assert calls[0]["headers"]["cookie"] == "__Secure-neon-auth.session_token=session-token"
+    assert calls[0]["url"].endswith("/token")
+    assert "__Secure-neon-auth.session_token=session-token" in calls[0]["headers"]["cookie"]
     assert driver._credential() == token
     assert len(calls) == 1
 

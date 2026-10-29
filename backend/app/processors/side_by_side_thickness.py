@@ -79,12 +79,13 @@ def side_by_side_thickness(config: dict, fields: dict) -> dict:
             sensor_thickness[key] = round(thickness, 6)
         actual = round(sum(sensor_thickness.values()) / len(sensor_thickness), 6) if sensor_thickness else None
     else:
-        values = [value for _, value in measurement]
-        if not values:
+        if not measurement:
             return result
         scale = _num(config.get("calibration.scale"), -1.0)
         offset = _num(config.get("calibration.offset"), 0.0)
-        actual = round(scale * (sum(values) / len(values)) + offset, 6)
+        for key, value in measurement:
+            sensor_thickness[key] = round(scale * value + offset, 6)
+        actual = round(sum(sensor_thickness.values()) / len(sensor_thickness), 6)
 
     if actual is None:
         return result

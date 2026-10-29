@@ -10,18 +10,20 @@ by the orchestrator (it is data, never instructions).
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Union
 
 from ...config import settings
 from ...db import fetch_all, fetch_one
 from ..devices import load_device
 from ..instances import get_instance, instance_device_ids, load_config
 from ..limits import bounds
+from ..mappings import active_mapping
 from ..sbs_calibration import DEFAULT_INPUT_KEY, derived_key, parse_baselines, sensor_keys
 from ..templates import load_template
 from .context import AIContext
-from .timeframes import TimeframeError, TimeRange, resolve_range
+from .timeframes import TimeframeError, TimeRange, plant_timezone, resolve_range
 
 NUMERIC_RE = r"^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$"
 
@@ -68,6 +70,15 @@ def _round(value, digits: int = 6) -> Optional[float]:
 
 def _normalise(value: str) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _path_tokens(path: str) -> list[str]:
+    """Turn a mapping dot/bracket path into PostgreSQL jsonb #>> tokens."""
+    text = str(path or "").strip()
+    if text.startswith("$"):
+        text = text[1:]
+    text = text.lstrip(".")
+    return [token for token in re.split(r"\.|\[|\]", text) if token != ""]
 
 
 def _numeric_expr(field: str, param: str) -> str:
@@ -384,15 +395,21 @@ class AnalyticsService:
         )
         return lower_num, upper_num, active
 
-    def _base_result(self, meta: dict, timeframe: TimeRange, *, metric: str,
+    def _base_result(self, meta: dict, timeframe: Union[TimeRange, dict, None], *, metric: str,
                      sensor: Optional[dict], data: dict) -> dict:
+        time_range = (
+            timeframe.as_dict() if hasattr(timeframe, "as_dict") else timeframe
+        )
         result = {
             "source": "metrics.measurements",
+            "data_source": "metrics.measurements",
             "machine": {"machine_id": meta["instance_id"], "name": meta["name"],
                         "asset_id": meta.get("asset_id"), "plant": meta.get("plant")},
             "metric": metric,
+            "measurement_type": metric,
+            "unit": meta["unit"],
             "sensor": sensor,
-            "time_range": timeframe.as_dict(),
+            "time_range": time_range,
             "units": {metric: meta["unit"]},
         }
         result.update(data)
@@ -439,6 +456,105 @@ class AnalyticsService:
                   "target": _round(meta["config"].get(meta["roles"].get("target") or "thickness.target_mm"))},
         )
 
+    def get_latest_measurement(self, ctx: AIContext, machine_id: Optional[str] = None,
+                               machine_name: Optional[str] = None, sensor: Optional[str] = None,
+                               metric: str = "thickness", period: Optional[str] = None,
+                               date: Optional[str] = None, shift: Optional[str] = None,
+                               start: Optional[str] = None, end: Optional[str] = None) -> dict:
+        """Latest non-NULL sensor sample, optionally constrained to a time range.
+
+        No range is required: "latest" means the most recent stored measurement.
+        If the caller supplies a range, the same plant-local/inclusive-exclusive
+        rules as every other tool apply.
+        """
+        meta = self._resolve_machine(ctx, machine_id, machine_name)
+        sensor_def = self._resolve_sensor(meta, sensor)
+        if metric not in METRICS:
+            metric = "thickness"
+        value_field, _unit = _metric_value(meta, metric, (sensor_def or {}).get("key"))
+
+        timeframe = None
+        if any((period, date, shift, start, end)):
+            timeframe = self._range(meta, {"period": period, "date": date, "shift": shift,
+                                           "start": start, "end": end})
+
+        params = {
+            "c": ctx.company_id,
+            "i": meta["instance_id"],
+            "field": value_field,
+            "status_field": meta["roles"].get("status"),
+        }
+        where = ["company_id = %(c)s", "instance_id = %(i)s", "fields IS NOT NULL"]
+        if timeframe is not None:
+            where.extend(["ts >= %(a)s", "ts < %(b)s"])
+            params["a"] = timeframe.start
+            params["b"] = timeframe.end
+        sql = f"""
+            SELECT ts, value, status
+            FROM (
+                SELECT ts,
+                       {_numeric_expr(value_field, "field")} AS value,
+                       CASE WHEN %(status_field)s IS NULL THEN NULL
+                            ELSE fields->>%(status_field)s END AS status
+                FROM metrics.measurements
+                WHERE {' AND '.join(where)}
+            ) s
+            WHERE value IS NOT NULL
+            ORDER BY ts DESC
+            LIMIT 1
+        """
+        row = fetch_one(sql, params) or {}
+        ts = row.get("ts")
+        tz = plant_timezone(meta["config"])
+        if timeframe is not None:
+            time_range = timeframe.as_dict()
+        elif ts is not None:
+            local = ts.astimezone(tz)
+            time_range = {
+                "start": local.isoformat(),
+                "end": local.isoformat(),
+                "start_local": local.isoformat(),
+                "end_local": local.isoformat(),
+                "timezone": str(tz),
+                "label": "latest reading",
+            }
+        else:
+            time_range = {"start": None, "end": None, "timezone": str(tz),
+                          "label": "latest reading"}
+
+        if not row:
+            return self._base_result(
+                meta, time_range, metric=metric, sensor=sensor_def,
+                data={"latest": None, "value": None, "timestamp": None,
+                      "timestamp_utc": None, "quality_status": None,
+                      "database_rows": 0, "sensor_samples": 0,
+                      "has_data": False, "empty": True},
+            )
+
+        local = ts.astimezone(tz)
+        value = _round(row.get("value"))
+        return self._base_result(
+            meta, time_range, metric=metric, sensor=sensor_def,
+            data={
+                "latest": {
+                    "timestamp": local.isoformat(),
+                    "timestamp_utc": ts.astimezone(timezone.utc).isoformat(),
+                    "value": value,
+                    "quality_status": row.get("status"),
+                    "sensor": sensor_def,
+                },
+                "value": value,
+                "timestamp": local.isoformat(),
+                "timestamp_utc": ts.astimezone(timezone.utc).isoformat(),
+                "quality_status": row.get("status"),
+                # One measurement row = one sensor sample for the selected field.
+                "database_rows": 1,
+                "sensor_samples": 1,
+                "has_data": True,
+                "empty": False,
+            },
+        )
+
     def compare_filtered_unfiltered(self, ctx: AIContext, machine_id: Optional[str] = None,
                                     machine_name: Optional[str] = None,
                                     period: Optional[str] = None, date: Optional[str] = None,
@@ -450,7 +566,7 @@ class AnalyticsService:
         device_ids = instance_device_ids(meta["instance_id"])
         if not device_ids:
             device_ids = [meta["instance_id"]]
-        raw = fetch_one(
+        raw_counts = fetch_one(
             """
             SELECT count(*) AS raw_count, min(ts) AS first_ts, max(ts) AS last_ts
             FROM metrics.raw_device_messages
@@ -467,12 +583,93 @@ class AnalyticsService:
             """,
             (ctx.company_id, meta["instance_id"], timeframe.start, timeframe.end),
         ) or {}
-        raw_count = int(raw.get("raw_count") or 0)
+        raw_count = int(raw_counts.get("raw_count") or 0)
         processed_count = int(processed.get("processed_count") or 0)
         try:
             window = int(float(meta["config"].get("filter.window") or 1))
         except (TypeError, ValueError):
             window = 1
+
+        # Filtered statistics come from the processed measurement fields.
+        primary_field = meta["roles"].get("primary") or "thickness.actual_mm"
+        processed_stats = self._stats(
+            ctx, meta, timeframe, primary_field, meta["roles"].get("status"))
+
+        # Unfiltered statistics come from the raw payload. The numeric source path
+        # is the active mapping's path for this machine's primary input/field, so
+        # no customer-specific payload key is hard-coded.
+        raw_path = None
+        targets = {primary_field, meta.get("input_key"), "displacement.value_mm"}
+        for device_id in device_ids:
+            mapping = active_mapping(meta["instance_id"], device_id)
+            if not mapping:
+                continue
+            for rule in (mapping.get("definition") or {}).get("fields", []) or []:
+                if rule.get("target") in targets and rule.get("path"):
+                    raw_path = rule["path"]
+                    break
+            if raw_path:
+                break
+
+        raw_stats = None
+        raw_note = None
+        if raw_path:
+            tokens = _path_tokens(raw_path)
+            lower, upper, _active = self._limits(meta)
+            raw_where = [
+                "company_id = %(c)s", "device_id = ANY(%(devices)s)",
+                "ts >= %(a)s", "ts < %(b)s", "raw_payload IS NOT NULL",
+            ]
+            raw_params = {
+                "c": ctx.company_id, "devices": device_ids,
+                "a": timeframe.start, "b": timeframe.end, "path": tokens,
+            }
+            select_parts = [
+                "count(*) AS messages",
+                "count(value) AS values_count",
+                "avg(value) AS average",
+                "min(value) AS minimum",
+                "max(value) AS maximum",
+            ]
+            if lower is not None:
+                select_parts.append(
+                    "count(*) FILTER (WHERE value < %(lower)s) AS below_count")
+                raw_params["lower"] = lower
+            else:
+                select_parts.append("NULL AS below_count")
+            if upper is not None:
+                select_parts.append(
+                    "count(*) FILTER (WHERE value > %(upper)s) AS above_count")
+                raw_params["upper"] = upper
+            else:
+                select_parts.append("NULL AS above_count")
+            raw_sql = f"""
+                SELECT {', '.join(select_parts)}
+                FROM (
+                    SELECT CASE
+                             WHEN (raw_payload #>> %(path)s) ~ '{NUMERIC_RE}'
+                             THEN (raw_payload #>> %(path)s)::float
+                           END AS value
+                    FROM metrics.raw_device_messages
+                    WHERE {' AND '.join(raw_where)}
+                ) s
+            """
+            raw_row = fetch_one(raw_sql, raw_params) or {}
+            raw_stats = {
+                "messages": int(raw_row.get("messages") or 0),
+                "values_count": int(raw_row.get("values_count") or 0),
+                "average": _round(raw_row.get("average")),
+                "minimum": _round(raw_row.get("minimum")),
+                "maximum": _round(raw_row.get("maximum")),
+                "below_count": int(raw_row["below_count"]) if raw_row.get("below_count") is not None else None,
+                "above_count": int(raw_row["above_count"]) if raw_row.get("above_count") is not None else None,
+                "path": raw_path,
+                "note": "Numeric values extracted from raw_payload using the active mapping path.",
+            }
+        else:
+            raw_note = ("No active mapping path was found for the raw payload, so raw value "
+                        "statistics are unavailable. Raw message counts are still reported.")
+
         result = self._base_result(
             meta, timeframe, metric="readings", sensor=None,
             data={
@@ -481,13 +678,19 @@ class AnalyticsService:
                 "processed_readings": processed_count,
                 "filtered_readings": processed_count,
                 "difference": raw_count - processed_count,
+                "raw_statistics": raw_stats,
+                "unfiltered_statistics": raw_stats,
+                "processed_statistics": processed_stats,
+                "filtered_statistics": processed_stats,
                 "filter": {"window": window, "trim_pct": _num(meta["config"].get("filter.trim_pct")) or 0,
                            "active": window > 1},
                 "note": "Raw/unfiltered counts come from metrics.raw_device_messages; processed/filtered "
-                        "counts are stored measurements. A raw message may feed more than one application.",
+                        "counts are stored measurements. A raw message may feed more than one application."
+                        + (f" {raw_note}" if raw_note else ""),
             },
         )
         result["source"] = "metrics.raw_device_messages + metrics.measurements"
+        result["data_source"] = result["source"]
         return result
 
     def get_out_of_range_readings(self, ctx: AIContext, machine_id: Optional[str] = None,
@@ -503,20 +706,36 @@ class AnalyticsService:
             metric = "thickness"
         value_field, _unit = _metric_value(meta, metric, (sensor_def or {}).get("key"))
         lower, upper, limit_active = self._limits(meta)
-        conditions, params = [], {
+        params = {
             "c": ctx.company_id, "i": meta["instance_id"], "a": timeframe.start,
             "b": timeframe.end, "field": value_field,
             "status_field": meta["roles"].get("status"),
         }
+        below_condition = None
+        above_condition = None
         if lower is not None:
-            conditions.append("v < %(lower)s")
+            below_condition = "v < %(lower)s"
             params["lower"] = lower
         if upper is not None:
-            conditions.append("v > %(upper)s")
+            above_condition = "v > %(upper)s"
             params["upper"] = upper
+        conditions = [c for c in (below_condition, above_condition) if c]
         condition = " OR ".join(conditions) if conditions else "FALSE"
+        below = below_condition or "FALSE"
+        above = above_condition or "FALSE"
+        if lower is not None and upper is not None:
+            in_range = "v >= %(lower)s AND v <= %(upper)s"
+        elif lower is not None:
+            in_range = "v >= %(lower)s"
+        elif upper is not None:
+            in_range = "v <= %(upper)s"
+        else:
+            in_range = "FALSE"
         sql = f"""
             SELECT count(v) AS values_count,
+                   count(*) FILTER (WHERE {below}) AS below_count,
+                   count(*) FILTER (WHERE {above}) AS above_count,
+                   count(*) FILTER (WHERE {in_range}) AS in_range_count,
                    count(*) FILTER (WHERE {condition}) AS out_count,
                    min(v) FILTER (WHERE {condition}) AS out_min,
                    max(v) FILTER (WHERE {condition}) AS out_max,
@@ -553,13 +772,23 @@ class AnalyticsService:
             ]
         values_count = int(row.get("values_count") or 0)
         out_count = int(row.get("out_count") or 0)
+        below_count = int(row.get("below_count") or 0) if lower is not None else None
+        above_count = int(row.get("above_count") or 0) if upper is not None else None
+        in_range_count = int(row.get("in_range_count") or 0) if conditions else None
         return self._base_result(
             meta, timeframe, metric=metric, sensor=sensor_def,
             data={
                 "configured": bool(conditions),
                 "limits_active": limit_active,
                 "limits": {"lower": lower, "upper": upper},
+                "thresholds": {"lower": lower, "upper": upper,
+                               "configured": bool(conditions), "active": limit_active},
                 "values_count": values_count,
+                "below_count": below_count,
+                "above_count": above_count,
+                "in_range_count": in_range_count,
+                "counts": {"below": below_count, "above": above_count,
+                           "in_range": in_range_count},
                 "out_of_range_count": out_count,
                 "out_of_range_percentage": round(out_count / values_count * 100, 2) if values_count else None,
                 "out_of_range_minimum": _round(row.get("out_min")),

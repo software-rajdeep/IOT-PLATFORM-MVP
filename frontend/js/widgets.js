@@ -233,12 +233,14 @@ export function renderWidget(type, d, state = {}) {
       const list = d.sensors || [];
       if (!list.length) return `<div class="empty">one sensor — add more in Setup › Map</div>`;
       return `<div class="raw-current-grid">${list.map((s) => {
-        const value = s.is_reference ? s.error : s.thickness;
-        const shown = value != null ? value : (s.distance != null ? s.distance : s.value);
+        const computed = s.is_reference ? s.error : s.thickness;
+        const raw = s.distance != null ? s.distance : s.value;
+        const shown = computed != null ? computed : raw;
+        const caption = s.is_reference ? "reference error" : (computed != null ? "thickness" : "raw input");
         return `<div class="raw-current-item">
           <div class="stat-sub">${esc(s.label || s.key)}</div>
           <div class="big ${cls(s.status)}">${fmt(shown)}<span class="u">${u}</span></div>
-          <div class="stat-sub">${s.is_reference ? "error" : "thickness"}</div>
+          <div class="stat-sub">${caption}</div>
         </div>`;
       }).join("")}</div>`;
     }
@@ -248,11 +250,13 @@ export function renderWidget(type, d, state = {}) {
       const refs = [{ v: cfg.lower, color: "var(--bad)" }, { v: cfg.target, color: "var(--muted)" },
         { v: cfg.upper, color: "var(--bad)" }];
       return `<div class="sensor-trend-grid">${list.map((s) => {
-        const series = (s.thickness_series && s.thickness_series.length) ? s.thickness_series : s.series;
+        const thickness = s.thickness_series && s.thickness_series.length ? s.thickness_series : null;
+        const series = thickness || s.series;
         const latest = s.thickness != null ? s.thickness : (s.distance != null ? s.distance : s.value);
         return `<div class="sensor-trend-item">
           <div class="sensor-trend-head"><span>${esc(s.label || s.key)}</span>
             <span class="td-mono ${cls(s.status)}">${fmt(latest)} ${u}</span></div>
+          <div class="stat-sub">${thickness ? "thickness" : "raw input"}</div>
           ${lineChart(series || [], "value", refs, 130)}
         </div>`;
       }).join("")}</div>`;

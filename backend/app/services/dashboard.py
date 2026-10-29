@@ -20,6 +20,7 @@ from . import alerts
 from .devices import load_device, serialize_device
 from .instances import _json, get_instance, instance_device_ids, load_config
 from .limits import bounds
+from .mappings import active_mapping
 from .opposite_calibration import (
     ZERO_OFFSET_MM,
     auto_gap_active,
@@ -81,18 +82,30 @@ def get_layout(instance_id: str, template: dict, config: Optional[dict] = None) 
 
 def _sensor_thickness_series(processor_key: str, config: dict, keys: list[str],
                              per_key: dict, ref_key: Optional[str]) -> dict:
-    """Per-sensor thickness trend for side-by-side baseline calibration.
+    """Per-sensor thickness trend for side-by-side calibration.
 
     Mirrors ``processors.side_by_side_thickness`` so each sensor graph uses the
-    same ``reference + (baseline - current) + reference drift`` formula as the
-    live per-sensor values. Other processors keep raw series only.
+    same maths as its live value: ``scale * input + offset`` for linear
+    calibration, or ``reference + (baseline - current) + reference drift`` for
+    baseline calibration. Other processors keep raw series only.
     """
     if processor_key != "sbs_thickness":
         return {}
     mode = str((config or {}).get("calibration.mode") or "auto").strip().lower()
     baselines = parse_baselines(config)
     if mode == "linear" or not baselines:
-        return {}
+        scale = _num((config or {}).get("calibration.scale"))
+        scale = -1.0 if scale is None else scale
+        offset = _num((config or {}).get("calibration.offset")) or 0.0
+        out: dict[str, list] = {}
+        for key in keys:
+            if key == ref_key:
+                continue
+            out[key] = [
+                {"ts": point["ts"], "value": round(scale * point["value"] + offset, 6)}
+                for point in per_key.get(key, []) if point["value"] is not None
+            ]
+        return out
     reference_thickness = _num((config or {}).get("calibration.reference_thickness")) or 0.0
     ref_base = baselines.get(ref_key) if ref_key else None
     ref_values: dict[str, float] = {}
@@ -279,7 +292,20 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
     sensors = []
     ref_key = None
     if input_key:
-        keys = sensor_keys(latest_fields, input_key) or [input_key]
+        # Every sensor mapped to this input gets a card and a chart, even before
+        # the first reading arrives or when the latest row omitted a column.
+        mapped_keys: list[str] = []
+        mapping = active_mapping(instance_id, device_id) if device_id else None
+        if mapping:
+            targets = [f.get("target") for f in (mapping.get("definition") or {}).get("fields", [])
+                       if f.get("target")]
+            mapped_keys = [k for k in sensor_keys({t: None for t in targets}, input_key)
+                           if k not in mapped_keys]
+        keys = sensor_keys(latest_fields, input_key)
+        for key in mapped_keys:
+            if key not in keys:
+                keys.append(key)
+        keys = sensor_keys({k: None for k in keys}, input_key) or [input_key]
         ref_key = reference_key(config, keys)
         per_key = {k: [] for k in keys}
         for r in series_rows:
@@ -287,12 +313,21 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             for k in keys:
                 per_key[k].append({"ts": r["ts"].isoformat(), "value": _num(f.get(k))})
         thickness_series = _sensor_thickness_series(processor_key, config, keys, per_key, ref_key)
+        linear = (processor_key == "sbs_thickness"
+                  and (str(config.get("calibration.mode") or "auto").strip().lower() == "linear"
+                       or not parse_baselines(config)))
+        linear_scale = _num(config.get("calibration.scale"))
+        linear_scale = -1.0 if linear_scale is None else linear_scale
+        linear_offset = _num(config.get("calibration.offset")) or 0.0
         sensors = []
         for i, k in enumerate(keys):
             suffix = k[len(input_key):] if k.startswith(input_key) else ""
             thickness_key = f"thickness.sensor_mm{suffix}"
             status_key = "quality.reference_status" if k == ref_key else f"quality.sensor_status{suffix}"
             value = _num(latest_fields.get(k))
+            thickness = _num(latest_fields.get(thickness_key))
+            if thickness is None and linear and value is not None and k != ref_key:
+                thickness = round(linear_scale * value + linear_offset, 6)
             distance = None
             if processor_key == "opposite_thickness" and value is not None:
                 distance = round(ZERO_OFFSET_MM + value, 6)
@@ -301,7 +336,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
                 "label": f"Sensor {i + 1}" + (" (reference)" if k == ref_key else ""),
                 "value": value,
                 "distance": distance,
-                "thickness": _num(latest_fields.get(thickness_key)),
+                "thickness": thickness,
                 "status": latest_fields.get(status_key),
                 "error": _num(latest_fields.get("reference.error_mm")) if k == ref_key else None,
                 "is_reference": k == ref_key,

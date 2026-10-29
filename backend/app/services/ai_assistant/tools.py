@@ -86,6 +86,17 @@ _TOOL_SPECS = [
         "handler": "get_thickness_statistics",
     },
     {
+        "name": "get_latest_measurement",
+        "description": "Return the most recent non-empty sensor measurement for a machine, "
+                       "optionally restricted to a plant-local time range.",
+        "parameters": {
+            "type": "object",
+            "properties": {**MACHINE_PROPS, **TIME_PROPS, **SENSOR_METRIC_PROPS},
+            "additionalProperties": False,
+        },
+        "handler": "get_latest_measurement",
+    },
+    {
         "name": "compare_filtered_unfiltered",
         "description": "Compare raw/unfiltered ingested readings with processed/filtered stored readings.",
         "parameters": {
@@ -97,7 +108,8 @@ _TOOL_SPECS = [
     },
     {
         "name": "get_out_of_range_readings",
-        "description": "Count readings outside the machine's configured lower/upper limits, with samples.",
+        "description": "Count readings above and below the machine's configured lower/upper limits, "
+                       "with separate above/below/in-range counts and samples.",
         "parameters": {
             "type": "object",
             "properties": {**MACHINE_PROPS, **TIME_PROPS, **SENSOR_METRIC_PROPS},

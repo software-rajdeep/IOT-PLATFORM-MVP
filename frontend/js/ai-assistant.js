@@ -218,7 +218,10 @@ function openPanel() {
   fab.setAttribute("aria-expanded", "true");
   setStatus("Assistant opened.");
   renderLog();
-  requestAnimationFrame(() => input.focus());
+  input.focus();
+  requestAnimationFrame(() => {
+    if (state.open) input.focus();
+  });
 }
 
 function closePanel(returnFocus = true) {

@@ -301,20 +301,24 @@ def test_device(device_id: str, user: dict = Depends(get_current_user)) -> dict:
     if not connector_cls:
         raise HTTPException(status_code=400, detail=f"No connector for {driver_key}")
     payload = None
+    reading = None
     replay = False
+    connected = False
     try:
         connector = connector_cls(connector_config(device), {"centre_distance": device.get("centre_distance")})
-        connected = connector.checkConnection()
-        reading = None
         replay = bool(getattr(connector, "replay", False))
-        if connected:
-            if replay and hasattr(connector, "read_replay_payload"):
-                result = connector.read_replay_payload(None)
-                payload = result[0] if result else None
-            elif not connector.simulate and hasattr(connector, "read_payload"):
-                payload = connector.read_payload()
-            else:
-                reading = connector.readMeasurement()
+        if replay and hasattr(connector, "read_replay_payload"):
+            result = connector.read_replay_payload(None)
+            payload = result[0] if result else None
+            connected = payload is not None
+        elif not connector.simulate and hasattr(connector, "read_payload"):
+            # Read directly instead of checkConnection() so a real error (bad token,
+            # missing table, forbidden role) reaches the operator instead of "FAILED".
+            payload = connector.read_payload()
+            connected = payload is not None
+        else:
+            reading = connector.readMeasurement()
+            connected = reading.get("communication_status") == "online"
         connector.disconnect()
     except Exception as exc:
         return {"connected": False, "error": str(exc)}

@@ -47,11 +47,14 @@ def test_side_by_side_thickness_averages_all_sensor_readings():
         "displacement.value_mm": 1.4,
         "displacement.value_mm_b": 1.6,
     })
-    assert result == {
-        "thickness.actual_mm": 8.5,
-        "thickness.deviation_mm": 0.0,
-        "quality.status": "PASS",
-    }
+    assert result["thickness.actual_mm"] == 8.5
+    assert result["thickness.deviation_mm"] == 0.0
+    assert result["quality.status"] == "PASS"
+    # Linear calibration also exposes each sensor's own thickness and status.
+    assert result["thickness.sensor_mm"] == 8.6
+    assert result["thickness.sensor_mm_b"] == 8.4
+    assert result["quality.sensor_status"] == "PASS"
+    assert result["quality.sensor_status_b"] == "PASS"
 
 
 def test_side_by_side_thickness_supports_single_sensor_fallback():

@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_DIR, settings
 from .routers import (
-    ai, auth, catalog, demo_customer, devices, email_alerts, events, gateway,
+    ai, analytics, auth, catalog, demo_customer, devices, email_alerts, events, gateway,
     instance_setup, instances, meta, whatsapp,
 )
 from .services.dashboard import invalidate_dashboards
@@ -75,8 +75,9 @@ async def static_cache_policy(request, call_next):
     return response
 
 for module in (meta, auth, catalog, devices, instances, instance_setup, gateway, demo_customer,
-               email_alerts, events, ai, whatsapp):
+               email_alerts, events, ai, whatsapp, analytics):
     app.include_router(module.router)
+app.include_router(analytics.legacy_router, include_in_schema=False)
 app.include_router(gateway.push_router)
 app.include_router(email_alerts.legacy_router)
 
