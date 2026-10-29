@@ -25,3 +25,15 @@ Thumbs.db
 # local screenshots
 Screenshot*.png
 .pytest_cache/
+
+# Vercel
+.vercel/
+public/
+
+# node
+node_modules/
+
+# local env (AI Gateway key)
+.env.local
+.env*.local
+

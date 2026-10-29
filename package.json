@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "type": "module",
+  "name": "rajdeep-iot-platform",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node scripts/build-static.mjs"
+  },
+  "dependencies": {
+    "ai": "^7.0.157"
+  }
+}
