@@ -15,6 +15,10 @@ DEFAULT_SHIFTS = [{"name": "A", "start": "06:00", "end": "14:00"},
                   {"name": "B", "start": "14:00", "end": "22:00"},
                   {"name": "C", "start": "22:00", "end": "06:00"}]
 
+# Guard the numeric cast the same way the dashboard does: one blank/textual value
+# must not fail the whole shift report.
+_NUMERIC_RE = r"^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$"
+
 
 def export_csv(instance_id: str, template: dict, start: Optional[datetime], end: Optional[datetime],
                device_id: Optional[str] = None) -> Iterator[str]:
@@ -84,30 +88,35 @@ def shift_report(instance_id: str, template: dict, day: date) -> dict:
             SELECT count(*) AS n,
                    count(*) FILTER (WHERE fields->>%(st)s = 'PASS') AS pass_n,
                    count(*) FILTER (WHERE fields->>%(st)s = 'FAIL') AS fail_n,
-                   avg((fields->>%(p)s)::float) AS avg, min((fields->>%(p)s)::float) AS min,
-                   max((fields->>%(p)s)::float) AS max, stddev_samp((fields->>%(p)s)::float) AS std
-            FROM metrics.measurements
-            WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields IS NOT NULL
-            """, {"st": status, "p": primary, "i": instance_id, "a": start, "b": end}) or {}
+                   avg(v) AS avg, min(v) AS min, max(v) AS max, stddev_samp(v) AS std
+            FROM (SELECT fields, CASE WHEN (fields->>%(p)s) ~ %(num)s THEN (fields->>%(p)s)::float END AS v
+                  FROM metrics.measurements
+                  WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields IS NOT NULL) s
+            """, {"st": status, "p": primary, "num": _NUMERIC_RE,
+                  "i": instance_id, "a": start, "b": end}) or {}
         hourly = fetch_all(
             """
             SELECT date_trunc('hour', ts AT TIME ZONE %(tz)s) AS hour, count(*) AS n,
-                   avg((fields->>%(p)s)::float) AS avg,
+                   avg(v) AS avg,
                    count(*) FILTER (WHERE fields->>%(st)s = 'FAIL') AS fail_n
-            FROM metrics.measurements
-            WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields IS NOT NULL
+            FROM (SELECT ts, fields, CASE WHEN (fields->>%(p)s) ~ %(num)s THEN (fields->>%(p)s)::float END AS v
+                  FROM metrics.measurements
+                  WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields IS NOT NULL) s
             GROUP BY 1 ORDER BY 1
-            """, {"tz": str(tz), "p": primary, "st": status, "i": instance_id, "a": start, "b": end})
+            """, {"tz": str(tz), "p": primary, "num": _NUMERIC_RE, "st": status,
+                  "i": instance_id, "a": start, "b": end})
         groups = []
         if group:
             groups = fetch_all(
                 """
-                SELECT fields->>%(g)s AS grp, count(*) AS n, avg((fields->>%(p)s)::float) AS avg,
+                SELECT fields->>%(g)s AS grp, count(*) AS n, avg(v) AS avg,
                        count(*) FILTER (WHERE fields->>%(st)s = 'FAIL') AS fail_n
-                FROM metrics.measurements
-                WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields ? %(g)s
+                FROM (SELECT fields, CASE WHEN (fields->>%(p)s) ~ %(num)s THEN (fields->>%(p)s)::float END AS v
+                      FROM metrics.measurements
+                      WHERE instance_id = %(i)s AND ts >= %(a)s AND ts < %(b)s AND fields ? %(g)s) s
                 GROUP BY 1 ORDER BY 1
-                """, {"g": group, "p": primary, "st": status, "i": instance_id, "a": start, "b": end})
+                """, {"g": group, "p": primary, "num": _NUMERIC_RE, "st": status,
+                      "i": instance_id, "a": start, "b": end})
         alerts_n = fetch_one(
             "SELECT count(*) AS n FROM metrics.alert_events WHERE instance_id = %s AND created_at >= %s AND created_at < %s",
             (instance_id, start, end))

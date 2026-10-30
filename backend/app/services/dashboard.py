@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -37,6 +38,27 @@ def _num(value):
         return float(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+# Only values that look numeric are cast in SQL. A blank or textual value in the
+# primary field must not abort the whole dashboard bundle (the AI analytics
+# service guards its casts the same way).
+_NUMERIC_RE = r"^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$"
+
+
+def capability_indices(mean: Optional[float], sigma: Optional[float],
+                       lower: Optional[float], upper: Optional[float]) -> dict:
+    """Cp / Cpk from the window mean and sample standard deviation.
+
+    ``Cp = (USL - LSL) / 6σ`` and ``Cpk = min(USL - µ, µ - LSL) / 3σ``. A missing
+    or zero σ, missing limits or inverted limits return ``None`` instead of a
+    division by zero / a meaningless negative spread.
+    """
+    if (mean is None or sigma is None or not math.isfinite(sigma) or sigma <= 0
+            or lower is None or upper is None or upper <= lower):
+        return {"cp": None, "cpk": None}
+    return {"cp": round((upper - lower) / (6 * sigma), 3),
+            "cpk": round(min(upper - mean, mean - lower) / (3 * sigma), 3)}
 
 
 # Run-mode sections the customer can show/hide (config key ui.<name>, "0" = off).
@@ -219,16 +241,19 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
 
     stats = fetch_one(
         """
-        SELECT count(*) AS total,
-               count(*) FILTER (WHERE fields->>%(st)s = 'PASS') AS pass_count,
-               count(*) FILTER (WHERE fields->>%(st)s = 'FAIL') AS fail_count,
-               min((fields->>%(p)s)::float) AS minimum, max((fields->>%(p)s)::float) AS maximum,
-               avg((fields->>%(p)s)::float) AS average, stddev_samp((fields->>%(p)s)::float) AS std_dev
-        FROM (SELECT fields FROM metrics.measurements
-              WHERE instance_id = %(i)s AND device_id = %(d)s AND fields IS NOT NULL
-              ORDER BY ts DESC LIMIT %(w)s) s
+        SELECT count(*) AS readings,
+               count(v) AS samples,
+               count(*) FILTER (WHERE v IS NOT NULL AND status = 'PASS') AS pass_count,
+               count(*) FILTER (WHERE v IS NOT NULL AND status = 'FAIL') AS fail_count,
+               min(v) AS minimum, max(v) AS maximum, avg(v) AS average, stddev_samp(v) AS std_dev
+        FROM (SELECT CASE WHEN (fields->>%(p)s) ~ %(num)s THEN (fields->>%(p)s)::float END AS v,
+                     fields->>%(st)s AS status
+              FROM (SELECT fields FROM metrics.measurements
+                    WHERE instance_id = %(i)s AND device_id = %(d)s AND fields IS NOT NULL
+                    ORDER BY ts DESC LIMIT %(w)s) s) x
         """,
-        {"st": f_status, "p": f_primary, "i": instance_id, "d": device_id, "w": window},
+        {"st": f_status, "p": f_primary, "num": _NUMERIC_RE,
+         "i": instance_id, "d": device_id, "w": window},
     ) or {}
 
     series_rows = fetch_all(
@@ -252,28 +277,31 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
     if f_group:
         groups = fetch_all(
             """
-            SELECT fields->>%(g)s AS grp, count(*) AS n, avg((fields->>%(p)s)::float) AS average,
-                   stddev_samp((fields->>%(p)s)::float) AS std_dev,
-                   count(*) FILTER (WHERE fields->>%(st)s = 'PASS') AS pass_count
-            FROM (SELECT fields FROM metrics.measurements WHERE instance_id = %(i)s AND device_id = %(d)s
-                  AND fields IS NOT NULL ORDER BY ts DESC LIMIT 2000) s
-            WHERE fields ? %(g)s GROUP BY 1 ORDER BY 1
+            SELECT grp, count(*) AS n, avg(v) AS average, stddev_samp(v) AS std_dev,
+                   count(*) FILTER (WHERE v IS NOT NULL AND status = 'PASS') AS pass_count,
+                   count(*) FILTER (WHERE v IS NOT NULL AND status = 'FAIL') AS fail_count
+            FROM (SELECT fields->>%(g)s AS grp,
+                         CASE WHEN (fields->>%(p)s) ~ %(num)s THEN (fields->>%(p)s)::float END AS v,
+                         fields->>%(st)s AS status
+                  FROM (SELECT fields FROM metrics.measurements WHERE instance_id = %(i)s AND device_id = %(d)s
+                        AND fields IS NOT NULL ORDER BY ts DESC LIMIT 2000) s) x
+            WHERE grp IS NOT NULL GROUP BY 1 ORDER BY 1
             """,
-            {"g": f_group, "p": f_primary, "st": f_status, "i": instance_id, "d": device_id},
+            {"g": f_group, "p": f_primary, "num": _NUMERIC_RE, "st": f_status,
+             "i": instance_id, "d": device_id},
         )
         groups = [{"group": g["grp"], "count": int(g["n"]), "average": _num(g["average"]),
                    "std_dev": _num(g["std_dev"]),
-                   "pass_percentage": round(int(g["pass_count"]) / int(g["n"]) * 100, 2) if g["n"] else None}
+                   "pass_percentage": round(int(g["pass_count"]) / (int(g["pass_count"]) + int(g["fail_count"])) * 100, 2)
+                   if (int(g["pass_count"]) + int(g["fail_count"])) else None}
                   for g in groups]
 
     target, lower, upper = (_num(config.get(roles.get(k))) if roles.get(k) else None for k in ("target", "lower", "upper"))
-    total = int(stats.get("total") or 0)
+    readings = int(stats.get("readings") or 0)
+    samples = int(stats.get("samples") or 0)
     pass_count, fail_count = int(stats.get("pass_count") or 0), int(stats.get("fail_count") or 0)
     mean, sigma = _num(stats.get("average")), _num(stats.get("std_dev"))
-    capability = {"cp": None, "cpk": None}
-    if sigma and sigma > 0 and lower is not None and upper is not None and mean is not None:
-        capability = {"cp": round((upper - lower) / (6 * sigma), 3),
-                      "cpk": round(min(upper - mean, mean - lower) / (3 * sigma), 3)}
+    capability = capability_indices(mean, sigma, lower, upper)
 
     devices = []
     for did in device_ids:
@@ -412,7 +440,7 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             "fields": latest_fields,
         },
         "statistics": {"minimum": _num(stats.get("minimum")), "maximum": _num(stats.get("maximum")),
-                       "average": mean, "std_dev": sigma, "samples": total},
+                       "average": mean, "std_dev": sigma, "samples": samples, "readings": readings},
         "quality": {"pass_count": pass_count, "fail_count": fail_count,
                     "pass_percentage": round(pass_count / (pass_count + fail_count) * 100, 2)
                     if (pass_count + fail_count) else None},
