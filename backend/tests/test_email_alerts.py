@@ -1,16 +1,34 @@
-from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 from app.config import settings
 from app.services import email_alerts
 
 
-def _use_tmp(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(email_alerts, "_DATA_DIR", tmp_path)
+@pytest.fixture
+def store(monkeypatch):
+    """In-memory replacement for the DB-backed storage helpers."""
+    configs: dict[str, dict] = {}
+    tokens: dict[str, dict] = {}
+    states: dict[str, dict] = {}
+
+    monkeypatch.setattr(email_alerts, "_read_config", lambda cid: configs.get(str(cid)))
+    monkeypatch.setattr(email_alerts, "_write_config", lambda cid, cfg: configs.__setitem__(str(cid), cfg))
+    monkeypatch.setattr(email_alerts, "_read_token", lambda cid: tokens.get(str(cid)))
+    monkeypatch.setattr(email_alerts, "_write_token", lambda cid, tok: tokens.__setitem__(str(cid), tok))
+    monkeypatch.setattr(
+        email_alerts,
+        "_store_oauth_state",
+        lambda state, cid, verifier: states.__setitem__(
+            state, {"company_id": str(cid), "code_verifier": verifier}
+        ),
+    )
+    monkeypatch.setattr(email_alerts, "_take_oauth_state", lambda state: states.pop(state, None))
+    return {"configs": configs, "tokens": tokens, "states": states}
 
 
-def test_config_roundtrip(monkeypatch, tmp_path):
-    _use_tmp(monkeypatch, tmp_path)
+def test_config_roundtrip(store):
     email_alerts.update_config(
         "company-a",
         {
@@ -28,8 +46,7 @@ def test_config_roundtrip(monkeypatch, tmp_path):
     assert config["cooldown"]["minutes"] == 12
 
 
-def test_auth_url_carries_state_and_redirect(monkeypatch, tmp_path):
-    _use_tmp(monkeypatch, tmp_path)
+def test_auth_url_carries_state_and_redirect(store, monkeypatch):
     monkeypatch.setattr(settings, "google_oauth_client_id", "client-id")
     monkeypatch.setattr(settings, "google_oauth_client_secret", "client-secret")
     monkeypatch.setattr(settings, "google_oauth_redirect_uri", "http://localhost:8000/callback")
@@ -42,10 +59,21 @@ def test_auth_url_carries_state_and_redirect(monkeypatch, tmp_path):
     assert "localhost%3A8000%2Fcallback" in url
     assert state.startswith("company-a:")
     assert query["state"][0] == state
+    # The PKCE verifier is persisted so any instance can finish the exchange.
+    saved = store["states"][state]
+    assert saved["company_id"] == "company-a"
+    assert saved["code_verifier"]
 
 
-def test_send_without_token_reports_reauthentication(monkeypatch, tmp_path):
-    _use_tmp(monkeypatch, tmp_path)
+def test_oauth_callback_rejects_unknown_state(store, monkeypatch):
+    monkeypatch.setattr(settings, "google_oauth_client_id", "client-id")
+    monkeypatch.setattr(settings, "google_oauth_client_secret", "client-secret")
+
+    with pytest.raises(RuntimeError, match="expired|already used"):
+        email_alerts.handle_oauth_callback("http://localhost/callback?code=x", "company-a:missing")
+
+
+def test_send_without_token_reports_reauthentication(store, monkeypatch):
     monkeypatch.setattr(settings, "google_oauth_client_id", "client-id")
     monkeypatch.setattr(settings, "google_oauth_client_secret", "client-secret")
     email_alerts.update_config("company-a", {"enabled": True, "recipient_email": "a@example.com"})

@@ -1,7 +1,10 @@
 """Gmail OAuth email delivery for alert notifications.
 
-Settings and tokens are stored per company under EMAIL_ALERT_DATA_DIR. Google
-client credentials come from the environment, never from source code.
+Settings and tokens are stored in the platform database
+(``core.email_alert_settings``) so they survive across serverless invocations.
+Pending OAuth state, including the PKCE verifier, lives in
+``core.email_oauth_states`` so the callback can be handled by any instance.
+Google client credentials come from the environment, never from source code.
 """
 from __future__ import annotations
 
@@ -9,17 +12,19 @@ import base64
 import copy
 import html
 import json
-import re
+import os
 import secrets
 import threading
 import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from pathlib import Path
 from typing import Optional
 
+from psycopg2.extras import Json
+
 from ..config import settings
+from ..db import execute, fetch_one
 
 try:
     from google.oauth2.credentials import Credentials
@@ -51,25 +56,84 @@ DEFAULT_CONFIG = {
     "cooldown": {"enabled": True, "minutes": 5},
 }
 
-_DATA_DIR = Path(settings.email_data_dir)
+OAUTH_STATE_TTL_MINUTES = 15
+
 _lock = threading.RLock()
-_pending_flows: dict[str, tuple[object, str]] = {}
 _last_alert_times: dict[tuple[str, str, str], float] = {}
 
 
-def _safe_name(company_id: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9_.-]", "_", str(company_id))
-    return value or "unknown"
+# --------------------------------------------------------------------------- storage
+def _read_config(company_id: str) -> Optional[dict]:
+    row = fetch_one(
+        "SELECT config FROM core.email_alert_settings WHERE company_id = %s",
+        (str(company_id),),
+    )
+    value = (row or {}).get("config")
+    return value if isinstance(value, dict) else None
 
 
-def _config_path(company_id: str) -> Path:
-    return _DATA_DIR / f"{_safe_name(company_id)}.json"
+def _write_config(company_id: str, config: dict) -> None:
+    execute(
+        """
+        INSERT INTO core.email_alert_settings (company_id, config, updated_at)
+        VALUES (%s, %s, now())
+        ON CONFLICT (company_id)
+        DO UPDATE SET config = EXCLUDED.config, updated_at = now()
+        """,
+        (str(company_id), Json(config)),
+    )
 
 
-def _token_path(company_id: str) -> Path:
-    return _DATA_DIR / f"{_safe_name(company_id)}.gmail_token.json"
+def _read_token(company_id: str) -> Optional[dict]:
+    row = fetch_one(
+        "SELECT token FROM core.email_alert_settings WHERE company_id = %s",
+        (str(company_id),),
+    )
+    value = (row or {}).get("token")
+    return value if isinstance(value, dict) else None
 
 
+def _write_token(company_id: str, token: Optional[dict]) -> None:
+    execute(
+        """
+        INSERT INTO core.email_alert_settings (company_id, token, updated_at)
+        VALUES (%s, %s, now())
+        ON CONFLICT (company_id)
+        DO UPDATE SET token = EXCLUDED.token, updated_at = now()
+        """,
+        (str(company_id), Json(token) if token is not None else None),
+    )
+
+
+def _store_oauth_state(state: str, company_id: str, code_verifier: Optional[str]) -> None:
+    execute(
+        "DELETE FROM core.email_oauth_states WHERE created_at < now() - make_interval(mins => %s)",
+        (OAUTH_STATE_TTL_MINUTES,),
+    )
+    execute(
+        """
+        INSERT INTO core.email_oauth_states (state, company_id, code_verifier, created_at)
+        VALUES (%s, %s, %s, now())
+        ON CONFLICT (state)
+        DO UPDATE SET company_id = EXCLUDED.company_id,
+                      code_verifier = EXCLUDED.code_verifier,
+                      created_at = now()
+        """,
+        (state, str(company_id), code_verifier),
+    )
+
+
+def _take_oauth_state(state: str) -> Optional[dict]:
+    row = fetch_one(
+        "SELECT company_id, code_verifier FROM core.email_oauth_states WHERE state = %s",
+        (state,),
+    )
+    if row:
+        execute("DELETE FROM core.email_oauth_states WHERE state = %s", (state,))
+    return row
+
+
+# --------------------------------------------------------------------------- config
 def _merge_config(loaded: dict) -> dict:
     merged = copy.deepcopy(DEFAULT_CONFIG)
     for key, value in (loaded or {}).items():
@@ -81,21 +145,11 @@ def _merge_config(loaded: dict) -> dict:
 
 
 def load_config(company_id: str) -> dict:
-    path = _config_path(company_id)
-    with _lock:
-        if not path.exists():
-            return copy.deepcopy(DEFAULT_CONFIG)
-        try:
-            return _merge_config(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            return copy.deepcopy(DEFAULT_CONFIG)
+    return _merge_config(_read_config(company_id) or {})
 
 
 def save_config(company_id: str, config: dict) -> dict:
-    path = _config_path(company_id)
-    with _lock:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    _write_config(company_id, config)
     return config
 
 
@@ -103,7 +157,7 @@ def public_config(company_id: str) -> dict:
     config = load_config(company_id)
     return {
         **config,
-        "gmail_authenticated": _token_path(company_id).exists(),
+        "gmail_authenticated": _read_token(company_id) is not None,
         "google_configured": google_configured(),
         "redirect_uri": settings.google_oauth_redirect_uri,
     }
@@ -142,6 +196,7 @@ def google_configured() -> bool:
     return bool(settings.google_oauth_client_id and settings.google_oauth_client_secret)
 
 
+# --------------------------------------------------------------------------- oauth
 def _client_config() -> dict:
     return {
         "web": {
@@ -174,8 +229,9 @@ def create_auth_url(company_id: str) -> tuple[str, str]:
     auth_url, _ = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
-    with _lock:
-        _pending_flows[state] = (flow, str(company_id))
+    # authorization_url() generates the PKCE verifier; persist it so the
+    # callback can complete even on a different serverless instance.
+    _store_oauth_state(state, str(company_id), getattr(flow, "code_verifier", None))
     return auth_url, state
 
 
@@ -183,35 +239,30 @@ def handle_oauth_callback(authorization_response: str, state: str) -> str:
     if not GOOGLE_API_AVAILABLE:
         raise RuntimeError("Google API libraries are not installed")
     if not state:
-        with _lock:
-            if len(_pending_flows) == 1:
-                state = next(iter(_pending_flows))
-    if not state:
         raise RuntimeError(
             "Missing OAuth state. Start again from the Email alerts panel; do not open the callback URL directly."
         )
 
-    company_id = state.split(":", 1)[0]
-    with _lock:
-        entry = _pending_flows.pop(state, None)
-    if entry is not None:
-        flow, company_id = entry
-    else:
-        flow = InstalledAppFlow.from_client_config(
-            _client_config(), SCOPES, redirect_uri=settings.google_oauth_redirect_uri
+    pending = _take_oauth_state(state)
+    if not pending:
+        raise RuntimeError(
+            "OAuth session expired or was already used. Start again from the Email alerts panel."
         )
-        flow.oauth2session.state = state
+    company_id = str(pending["company_id"])
 
+    flow = InstalledAppFlow.from_client_config(
+        _client_config(), SCOPES, redirect_uri=settings.google_oauth_redirect_uri
+    )
+    flow.oauth2session.state = state
+    flow.code_verifier = pending.get("code_verifier")
     flow.fetch_token(authorization_response=authorization_response)
+
     creds = flow.credentials
-    token_path = _token_path(company_id)
-    with _lock:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json(), encoding="utf-8")
+    _write_token(company_id, json.loads(creds.to_json()))
     config = load_config(company_id)
     config["api_type"] = "gmail_oauth"
     save_config(company_id, config)
-    return str(company_id)
+    return company_id
 
 
 def _get_gmail_service(company_id: str):
@@ -223,22 +274,19 @@ def _get_gmail_service(company_id: str):
     if not google_configured():
         return None, "Google OAuth client is not configured"
 
-    token_path = _token_path(company_id)
-    if not token_path.exists():
+    token_info = _read_token(company_id)
+    if not token_info:
         return None, "Not authenticated with Google. Click 'Sign in with Google' first."
 
     try:
-        creds = Credentials.from_authorized_user_info(
-            json.loads(token_path.read_text(encoding="utf-8")), SCOPES
-        )
-    except (OSError, ValueError) as exc:
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    except (ValueError, TypeError) as exc:
         return None, f"Failed to load Google credentials: {exc}"
 
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
-            with _lock:
-                token_path.write_text(creds.to_json(), encoding="utf-8")
+            _write_token(company_id, json.loads(creds.to_json()))
         except Exception as exc:
             return None, f"Failed to refresh Google credentials: {exc}. Re-authenticate."
 
@@ -251,6 +299,7 @@ def _get_gmail_service(company_id: str):
         return None, f"Failed to initialize Gmail API: {exc}"
 
 
+# --------------------------------------------------------------------------- delivery
 def _build_body(title: str, rows: list[tuple[str, str]], footer: Optional[str] = None) -> tuple[str, str]:
     table = "".join(
         f'<tr><td style="padding:8px;border:1px solid #ddd;"><strong>{html.escape(label)}</strong></td>'
@@ -353,9 +402,11 @@ def notify(company_id, instance_id: str, device_id: Optional[str], rule_type: st
                 return
             _mark_sent(key)
 
-    thread = threading.Thread(
-        target=_deliver_alert,
-        args=(str(company_id), instance_id, device_id or "", rule_type, severity, message),
-        daemon=True,
-    )
-    thread.start()
+    args = (str(company_id), instance_id, device_id or "", rule_type, severity, message)
+    # Serverless instances are frozen as soon as the response is sent, so a
+    # background thread would often be killed before Gmail finishes. Send inline
+    # on Vercel and keep the thread on long-running hosts.
+    if os.environ.get("VERCEL"):
+        _deliver_alert(*args)
+    else:
+        threading.Thread(target=_deliver_alert, args=args, daemon=True).start()
