@@ -18,7 +18,16 @@ from .sbs_calibration import parse_baselines, sensor_readings, DEFAULT_INPUT_KEY
 
 ZERO_OFFSET_MM = 35.0
 
+# Opposite-side is a two-sensor layout: A (input) and B (input.2). Any further mapped
+# column is ignored so a stray Sensor 3 never reaches calibration or the dashboard.
+MAX_SENSORS = 2
+
 GAP_KEYS = ("calibration.gap_distance", "gap_distance")
+
+
+def limit_readings(readings: list) -> list:
+    """Keep only the A/B pair, dropping any extra mapped sensor columns."""
+    return list(readings or [])[:MAX_SENSORS]
 
 
 def gap_distance(config: dict) -> Optional[float]:

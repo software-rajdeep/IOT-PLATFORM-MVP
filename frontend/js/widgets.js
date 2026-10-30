@@ -195,16 +195,32 @@ export function renderWidget(type, d, state = {}) {
     case "calibration_status": {
       const gap = cfg["calibration.gap_distance"];
       const baselines = cfg["calibration.baselines"] || {};
-      const isGap = cfg["calibration.mode"] === "gap" || cfg["calibration.mode"] === "auto_gap" || gap != null;
-      const isBaseline = !isGap && (cfg["calibration.mode"] === "baseline" || Object.keys(baselines).length > 0);
+      const configuredMode = cfg["calibration.mode"];
+      // The calibration method belongs to the application template. Do not infer it from
+      // whatever values happen to be in the config: a baseline app has no baselines yet
+      // before its first calibration, but it is still a baseline app (not the legacy
+      // two-point/linear formula). Config inference is only a fallback for old templates.
+      const method = ((d.template || {}).commissioning || {}).calibration;
+      const isGap = method === "gap" || method === "auto_gap"
+        || (!method && (configuredMode === "gap" || configuredMode === "auto_gap" || gap != null));
+      const isBaseline = !isGap && (method === "baseline"
+        || (!method && (configuredMode === "baseline" || Object.keys(baselines).length > 0)));
       // Baseline calibration stores one baseline per sensor, so it can be done one sensor
       // at a time. The other methods calibrate the whole device, so they get no picker.
       const list = d.sensors || [];
-      const method = ((d.template || {}).commissioning || {}).calibration;
       const perSensor = method === "baseline" && list.length > 1;
       const selected = perSensor && list.some((s) => s.key === state.sensor) ? state.sensor : "";
       const sel = list.find((s) => s.key === selected);
-      const done = sel ? baselines[sel.key] != null : !!cfg["calibration.calibrated_at"];
+      const baselineCount = list.filter((s) => baselines[s.key] != null).length;
+      const calibrated = !!cfg["calibration.calibrated_at"];
+      // "All sensors" is only calibrated when every mapped sensor has a baseline; a
+      // per-sensor capture sets calibrated_at even though the other sensors are still bare.
+      const done = sel
+        ? baselines[sel.key] != null
+        : isGap ? calibrated && gap != null
+        : isBaseline ? calibrated && list.length > 0 && baselineCount === list.length
+        : calibrated && cfg["calibration.scale"] != null && cfg["calibration.offset"] != null;
+      const partial = perSensor && !sel && baselineCount > 0 && !done;
       const detail = sel
         ? `baseline ${sel.key in baselines ? `${fmt(baselines[sel.key])} ${u}` : "—"} · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
         : isGap
@@ -212,12 +228,15 @@ export function renderWidget(type, d, state = {}) {
           ? ` · object ${fmt(cfg["calibration.object_thickness"])} ${u}` : ""}${cfg["calibration.tolerance_mm"] != null
           ? ` · ±${fmt(cfg["calibration.tolerance_mm"])} ${u}` : ""}`
         : isBaseline
-        ? `baseline on ${Object.keys(baselines).length || 0} sensor(s) · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
+        ? `baseline on ${perSensor ? `${baselineCount}/${list.length}` : baselineCount} sensor(s) · reference ${fmt(cfg["calibration.reference_thickness"])} ${u}`
         : `${d.label.toLowerCase()} = ${fmt(cfg["calibration.scale"], 4)} × input + ${fmt(cfg["calibration.offset"], 4)}`;
-      return `${perSensor ? sensorSelect(list, selected) : ""}<div class="cal-status-row">
-        <span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : "not calibrated"}</span>
+      // The graph-options page is a preview, not a live dashboard: it has no calibration
+      // handlers, so hide the action buttons there instead of rendering dead controls.
+      const actions = state.preview ? "" : `
         <button class="btn btn-sm" data-act="recalibrate">${done ? "Recalibrate" : "Calibrate"}</button>
-        ${done ? `<button class="btn secondary btn-sm" data-act="reset-calibration">Reset</button>` : ""}</div>
+        ${done && !sel ? `<button class="btn secondary btn-sm" data-act="reset-calibration">Reset</button>` : ""}`;
+      return `${perSensor ? sensorSelect(list, selected) : ""}<div class="cal-status-row">
+        <span class="badge ${done ? "good" : "warn"}">${done ? "calibrated" : partial ? `${baselineCount}/${list.length} calibrated` : "not calibrated"}</span>${actions}</div>
         <div class="stat-sub">${esc(detail)}
         ${done && !sel ? `<br/>by ${esc(cfg["calibration.calibrated_by"] || "")} · ${esc(new Date(cfg["calibration.calibrated_at"]).toLocaleString())}` : ""}</div>`;
     }

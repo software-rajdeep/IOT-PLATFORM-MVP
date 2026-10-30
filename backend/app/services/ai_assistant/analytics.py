@@ -20,6 +20,7 @@ from ..devices import load_device
 from ..instances import get_instance, instance_device_ids, load_config
 from ..limits import bounds
 from ..mappings import active_mapping
+from ..opposite_calibration import limit_readings
 from ..sbs_calibration import DEFAULT_INPUT_KEY, derived_key, parse_baselines, sensor_keys
 from ..templates import load_template
 from .context import AIContext
@@ -158,6 +159,9 @@ class AnalyticsService:
         fields = fields if fields is not None else {}
         input_key = meta["input_key"]
         keys = sensor_keys(fields, input_key)
+        if meta.get("processor_key") == "opposite_thickness":
+            # Opposite-side is a two-sensor layout: A + B only.
+            keys = limit_readings(keys)
         if not keys:
             keys = [key for key in parse_baselines(meta["config"]) if key == input_key or key.startswith(input_key)]
         if not keys:

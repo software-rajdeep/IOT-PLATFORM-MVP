@@ -3,7 +3,7 @@ import { DEFAULT_TITLES, STATIC_WIDGETS, renderWidget } from "../widgets.js";
 
 // A widget board on gridstack (vendored, global GridStack). Static on the dashboard,
 // draggable/resizable in the graph-options editor. Layout = [{id, type, x, y, w, h, title?}].
-export function mountBoard(container, layout, { editable = false, handlers = {}, onChange } = {}) {
+export function mountBoard(container, layout, { editable = false, handlers = {}, onChange, preview = false } = {}) {
   container.classList.add("grid-stack");
   container.innerHTML = "";
   const items = new Map();
@@ -19,7 +19,7 @@ export function mountBoard(container, layout, { editable = false, handlers = {},
     el.innerHTML = `<div class="grid-stack-item-content widget" data-type="${esc(w.type)}">
       <div class="w-head"><span class="w-title"></span>${editable ? `<button class="w-x" title="Remove">×</button>` : ""}</div>
       <div class="w-body"><div class="empty">loading…</div></div></div>`;
-    items.set(id, { id, type: w.type, title: w.title, el, drawn: false, state: {} });
+    items.set(id, { id, type: w.type, title: w.title, el, drawn: false, state: preview ? { preview: true } : {} });
     if (editable) el.querySelector(".w-x").addEventListener("click", () => remove(id));
     return el;
   }

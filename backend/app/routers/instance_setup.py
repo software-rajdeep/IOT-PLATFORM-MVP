@@ -13,12 +13,14 @@ from ..deps import get_current_user, require_company
 from ..drivers import get_driver_class
 from ..processors import get_processor
 from ..services import audit
+from ..services.calibration import calibration_complete
 from ..services.compat import resolve_widgets, unlocks_by_input
 from ..services.dashboard import get_layout
 from ..services.devices import _json, connector_config, connector_driver_key, load_device
 from ..services.instances import get_instance, load_config
 from ..services.mapping import flatten, map_payload, suggest, unit_hint, unmapped_required
-from ..services.mappings import active_mapping, device_preset, mapped_targets, save_mapping
+from ..services.mappings import active_mapping, device_preset, limit_extra_sensors, mapped_targets, save_mapping
+from ..services.sbs_calibration import mapped_sensor_keys, parse_baselines
 from ..services.templates import contract, load_template
 from ..services.units import units
 
@@ -60,6 +62,7 @@ def get_mapping(instance_id: str, user: dict = Depends(get_current_user)) -> dic
         "device_id": row.get("device_id"),
         "interface": (device or {}).get("interface"),
         "simulate": _json((device or {}).get("connection_parameters"), {}).get("simulate", False),
+        "sensor_layout": template.get("sensor_layout"),
         "contract": contract(template),
         "current": current,
         "preset": preset,
@@ -140,20 +143,24 @@ class SaveMappingRequest(BaseModel):
 @router.post("/{instance_id}/mapping")
 def save(instance_id: str, body: SaveMappingRequest, user: dict = Depends(get_current_user)) -> dict:
     row, template = _owned(instance_id, user)
-    missing = unmapped_required(body.definition, contract(template))
+    input_key = next((c["key"] for c in contract(template) if c.get("required")), None)
+    # Opposite-side is a two-sensor layout: A + B. Drop any third sensor column so it
+    # cannot be stored, previewed, or shown on the dashboard.
+    definition = limit_extra_sensors(body.definition, template, input_key)
+    missing = unmapped_required(definition, contract(template))
     if missing:
         raise HTTPException(status_code=400, detail=f"Map the required fields first: {', '.join(missing)}")
     known = {c["key"] for c in contract(template)}
     # Extra sensors are stored as "<field_key>.<n>" (e.g. displacement.value_mm.2), so
     # several sensor columns can feed the same application input.
-    unknown = [f.get("target") for f in body.definition.get("fields", [])
+    unknown = [f.get("target") for f in definition.get("fields", [])
                if f.get("target") and f.get("target") not in known
                and not any(str(f.get("target")).startswith(k + ".") for k in known)]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unknown template fields: {', '.join(map(str, unknown))}")
     old = active_mapping(instance_id, row["device_id"])
-    saved = save_mapping(instance_id, row["device_id"], body.definition, "manual", user["id"])
-    audit.log(user, "mapping.save", "instance", instance_id, old and old["definition"], body.definition)
+    saved = save_mapping(instance_id, row["device_id"], definition, "manual", user["id"])
+    audit.log(user, "mapping.save", "instance", instance_id, old and old["definition"], definition)
     return saved
 
 
@@ -224,11 +231,29 @@ def checklist(instance_id: str, row: dict, template: dict) -> list[dict]:
         {"key": "data", "label": "Data flowing (readings in the last 10 min)", "ok": bool(recent and recent["n"]),
          "required": False, "detail": f"{recent['n'] if recent else 0} readings"},
     ]
-    if (template.get("commissioning") or {}).get("calibration") in ("two_point", "baseline", "gap", "auto_gap"):
-        items.append({"key": "calibration", "label": "Calibrated with reference pieces", "required": True,
-                      "ok": config.get("calibration.calibrated_at") not in (None, ""),
-                      "detail": f"by {config.get('calibration.calibrated_by')} at {config.get('calibration.calibrated_at')}"
-                      if config.get("calibration.calibrated_at") else "Not calibrated yet"})
+    method = (template.get("commissioning") or {}).get("calibration")
+    if method in ("two_point", "baseline", "gap", "auto_gap"):
+        calibrated_at = config.get("calibration.calibrated_at")
+        input_key = (roles.get("input") or next(
+            (c.get("key") for c in template.get("requires") or [] if c.get("required")), None)
+            if method == "baseline" else None)
+        keys = mapped_sensor_keys(definition, input_key) if input_key else []
+        ok = calibration_complete(config, method, keys)
+        detail = (f"by {config.get('calibration.calibrated_by')} at {calibrated_at}"
+                  if calibrated_at else "Not calibrated yet")
+        if calibrated_at and not ok:
+            if method == "baseline":
+                baselines = parse_baselines(config)
+                missing_baselines = [key for key in keys if key not in baselines]
+                detail = (f"Baseline missing for {len(missing_baselines)} sensor(s): "
+                          f"{', '.join(missing_baselines)}"
+                          if missing_baselines else "No mapped sensors to calibrate")
+            elif method == "two_point":
+                detail = "Calibration scale/offset are missing"
+            else:
+                detail = "Gap distance is missing"
+        items.append({"key": "calibration", "label": "Calibrated with reference pieces",
+                      "required": True, "ok": ok, "detail": detail})
     limit_keys = [roles[k] for k in ("lower", "upper") if roles.get(k)]
     if limit_keys:
         items.append({"key": "limits", "label": "Limits set", "required": True,

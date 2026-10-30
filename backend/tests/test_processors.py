@@ -6,9 +6,11 @@ from app.processors.generic_monitoring import generic_monitoring
 from app.processors.opposite_side_thickness import opposite_side_thickness
 from app.processors.rubber_thickness import rubber_thickness
 from app.processors.side_by_side_thickness import side_by_side_thickness
-from app.services.calibration import compute_linear
+from app.services.calibration import calibration_complete, compute_linear, verify_tolerance
 from app.services.filters import trimmed_mean
+from app.services.instances import _steps
 from app.services.opposite_calibration import auto_gap_total, tolerance_limits
+from app.services.sbs_calibration import baseline_complete, mapped_sensor_keys
 
 
 def test_two_point_calibration_drives_thickness_and_limits():
@@ -24,6 +26,69 @@ def test_two_point_calibration_drives_thickness_and_limits():
 def test_identical_calibration_references_are_rejected():
     with pytest.raises(ValueError):
         compute_linear(8, 1, 9, 1)
+
+
+def test_verification_tolerance_defaults_and_can_be_overridden():
+    assert verify_tolerance({}) == 0.02
+    assert verify_tolerance({"calibration.verify_tolerance_mm": "0.05"}) == 0.05
+    assert verify_tolerance({}, 0.1) == 0.1
+    assert verify_tolerance({"calibration.verify_tolerance_mm": "bad"}, -0.03) == 0.03
+
+
+def test_calibration_completion_matches_each_method():
+    stamp = {"calibration.calibrated_at": "2026-10-30T10:00:00+00:00"}
+    assert calibration_complete({**stamp, "calibration.scale": -1, "calibration.offset": 10},
+                                "two_point") is True
+    assert calibration_complete(stamp, "two_point") is False
+    assert calibration_complete({**stamp, "calibration.gap_distance": 100}, "gap") is True
+    assert calibration_complete({**stamp, "calibration.gap_distance": 0}, "auto_gap") is False
+
+
+def test_baseline_completion_requires_every_mapped_sensor():
+    definition = {"fields": [
+        {"target": "displacement.value_mm"},
+        {"target": "displacement.value_mm.2"},
+    ]}
+    keys = mapped_sensor_keys(definition)
+    assert keys == ["displacement.value_mm", "displacement.value_mm.2"]
+
+    partial = {"calibration.baselines": json.dumps({"displacement.value_mm": 2.0})}
+    assert baseline_complete(partial, keys) is False
+    assert baseline_complete({
+        "calibration.baselines": json.dumps({
+            "displacement.value_mm": 2.0,
+            "displacement.value_mm.2": 2.5,
+        }),
+    }, keys) is True
+    assert baseline_complete({}, []) is False
+
+
+def test_baseline_steps_require_every_mapped_sensor():
+    row = {
+        "field_roles": {
+            "input": "displacement.value_mm",
+            "lower": "thickness.lower_limit_mm",
+            "upper": "thickness.upper_limit_mm",
+        },
+        "commissioning": {"calibration": "baseline"},
+        "requires": [{"key": "displacement.value_mm", "required": True}],
+    }
+    definition = {"fields": [
+        {"target": "displacement.value_mm"},
+        {"target": "displacement.value_mm.2"},
+    ]}
+    base = {
+        "calibration.calibrated_at": "2026-10-30T10:00:00+00:00",
+        "thickness.lower_limit_mm": "8.3",
+        "thickness.upper_limit_mm": "8.7",
+    }
+    partial = {**base, "calibration.baselines": json.dumps({"displacement.value_mm": 2.0})}
+    complete = {**base, "calibration.baselines": json.dumps({
+        "displacement.value_mm": 2.0,
+        "displacement.value_mm.2": 2.5,
+    })}
+    assert _steps(partial, "draft", row, definition)["calibrated"] is False
+    assert _steps(complete, "draft", row, definition)["calibrated"] is True
 
 
 def test_generic_limits_are_inclusive_and_optional():

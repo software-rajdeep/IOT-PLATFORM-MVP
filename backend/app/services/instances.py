@@ -5,6 +5,9 @@ import json
 from typing import Any, Optional
 
 from ..db import fetch_all, fetch_one, get_cursor
+from .calibration import calibration_complete
+from .mappings import active_mapping
+from .sbs_calibration import mapped_sensor_keys
 
 INSTANCE_SELECT = """
 SELECT
@@ -13,6 +16,7 @@ SELECT
     tpl.name AS template_name, tpl.version AS template_version,
     tpl.category, tpl.processor_key, tpl.inputs, tpl.dashboard,
     tpl.requires, tpl.optional, tpl.outputs, tpl.field_roles, tpl.commissioning, tpl.purpose_key,
+    tpl.sensor_layout,
     d.model_key, d.status AS device_status, d.last_seen, c.interface
 FROM core.template_instances t
 JOIN core.application_templates tpl ON tpl.template_id = t.template_id
@@ -55,15 +59,29 @@ def set_config(instance_id: str, values: dict) -> None:
         cur.execute("UPDATE core.template_instances SET updated_at = now() WHERE instance_id = %s", (instance_id,))
 
 
-def _steps(config: dict, status: str, row: Optional[dict] = None) -> dict:
-    roles = _json((row or {}).get("field_roles"), {}) or {
+def _input_key(row: dict) -> Optional[str]:
+    roles = _json(row.get("field_roles"), {})
+    return roles.get("input") or next(
+        (c.get("key") for c in _json(row.get("requires"), []) if c.get("required")), None)
+
+
+def _steps(config: dict, status: str, row: Optional[dict] = None,
+           definition: Optional[dict] = None) -> dict:
+    row = row or {}
+    roles = _json(row.get("field_roles"), {}) or {
         "target": "thickness.target_mm", "lower": "thickness.lower_limit_mm", "upper": "thickness.upper_limit_mm"}
-    commissioning = _json((row or {}).get("commissioning"), {})
-    needs_cal = commissioning.get("calibration") in ("two_point", "baseline", "gap", "auto_gap")
+    commissioning = _json(row.get("commissioning"), {})
+    method = commissioning.get("calibration")
+    needs_cal = method in ("two_point", "baseline", "gap", "auto_gap")
+    calibrated = (not needs_cal) or config.get("calibration.calibrated_at") not in (None, "")
+    if calibrated and needs_cal:
+        input_key = _input_key(row) if method == "baseline" else None
+        keys = mapped_sensor_keys(definition, input_key) if input_key else []
+        calibrated = calibration_complete(config, method, keys)
     limit_keys = [roles[k] for k in ("lower", "upper") if roles.get(k)]
     return {
         "connection": True,
-        "calibrated": (not needs_cal) or config.get("calibration.calibrated_at") not in (None, ""),
+        "calibrated": calibrated,
         "limits": bool(limit_keys) and all(config.get(k) not in (None, "") for k in limit_keys),
         "active": status == "active",
     }
@@ -71,6 +89,11 @@ def _steps(config: dict, status: str, row: Optional[dict] = None) -> dict:
 
 def serialize_instance(row: dict, config: Optional[dict] = None) -> dict:
     config = config if config is not None else load_config(row["instance_id"])
+    commissioning = _json(row.get("commissioning"), {})
+    definition = None
+    if commissioning.get("calibration") == "baseline" and config.get("calibration.calibrated_at") not in (None, ""):
+        mapping = active_mapping(row["instance_id"], row.get("device_id")) if row.get("device_id") else None
+        definition = (mapping or {}).get("definition")
     return {
         "instance_id": row["instance_id"],
         "name": row["name"],
@@ -80,7 +103,7 @@ def serialize_instance(row: dict, config: Optional[dict] = None) -> dict:
         "device_id": row.get("device_id"),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "config": config,
-        "steps": _steps(config, row["status"], row),
+        "steps": _steps(config, row["status"], row, definition),
         "interface": row.get("interface"),
         "model_key": row.get("model_key"),
         "template": {
@@ -90,6 +113,7 @@ def serialize_instance(row: dict, config: Optional[dict] = None) -> dict:
             "category": row.get("category"),
             "processor_key": row.get("processor_key"),
             "purpose_key": row.get("purpose_key"),
+            "sensor_layout": row.get("sensor_layout"),
             "inputs": _json(row.get("inputs"), []),
             "dashboard": _json(row.get("dashboard"), {}),
             "requires": _json(row.get("requires"), []),

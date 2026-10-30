@@ -136,7 +136,8 @@ export async function renderDashboard(view, ctx, setCleanup, instanceId) {
       const sensor = picker && picker.value ? picker.value : null;
       show("cal-modal");
       stopCal = calibrationPanel($("cal-host"), instanceId, activeDevice, () => refresh(),
-        { mode: (instance.template.commissioning || {}).calibration, sensor });
+        { mode: (instance.template.commissioning || {}).calibration, sensor,
+          verifyTolerance: (instance.config || {})["calibration.verify_tolerance_mm"] });
     },
     "reset-calibration": async () => {
       try { await api.resetCalibration(instanceId); toast("Calibration reset"); refresh(); }

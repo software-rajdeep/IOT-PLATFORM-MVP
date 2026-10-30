@@ -97,6 +97,26 @@ def parse_baselines(config: dict) -> dict[str, float]:
     return baselines
 
 
+def mapped_sensor_keys(definition: Optional[dict], input_key: str = DEFAULT_INPUT_KEY) -> list[str]:
+    """Sensor columns declared by a saved mapping definition (not just the latest payload)."""
+    targets = [
+        field.get("target")
+        for field in (definition or {}).get("fields", [])
+        if field.get("target")
+    ]
+    return sensor_keys({target: None for target in targets}, input_key)
+
+
+def baseline_complete(config: dict, keys: list[str]) -> bool:
+    """True when every mapped sensor has a captured baseline.
+
+    A per-sensor baseline capture merges into the existing map, so ``calibrated_at``
+    alone is not enough: the other sensors may still be uncalibrated.
+    """
+    baselines = parse_baselines(config)
+    return bool(keys) and all(key in baselines for key in keys)
+
+
 def reference_key(config: dict, keys: list[str]) -> Optional[str]:
     """Which sensor column is the drifting reference sensor.
 

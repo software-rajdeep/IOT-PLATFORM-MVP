@@ -23,6 +23,7 @@ from .instances import _json, get_instance, instance_device_ids, load_config
 from .limits import bounds, sensor_bounds, sensor_overrides
 from .mappings import active_mapping
 from .opposite_calibration import (
+    MAX_SENSORS,
     ZERO_OFFSET_MM,
     auto_gap_active,
     gap_distance,
@@ -334,6 +335,9 @@ def _build_dashboard(instance_id: str, company_id: Optional[str] = None, window:
             if key not in keys:
                 keys.append(key)
         keys = sensor_keys({k: None for k in keys}, input_key) or [input_key]
+        if processor_key == "opposite_thickness":
+            # Opposite-side is exactly two sensors (A + B); ignore any third column.
+            keys = keys[:MAX_SENSORS]
         ref_key = reference_key(config, keys)
         per_key = {k: [] for k in keys}
         for r in series_rows:

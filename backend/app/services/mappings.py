@@ -85,6 +85,27 @@ def ensure_initial_mapping(instance_id: str, device_id: str, template: dict, use
     return save_mapping(instance_id, device_id, definition, origin="preset", user_id=user_id)
 
 
+def limit_extra_sensors(definition: dict, template: dict, input_key: Optional[str]) -> dict:
+    """Opposite-side layouts use exactly two sensors: A (the input) and B (input.2).
+
+    Extra sensors are stored as ``<input>.<n>``. Keep the lowest-numbered extra
+    (Sensor 2 = B) and drop any further columns (Sensor 3, ...).
+    """
+    if (template.get("sensor_layout") or "") != "opposite" or not input_key:
+        return definition
+    kept: list[dict] = []
+    extras: list[tuple[int, dict]] = []
+    for field in (definition or {}).get("fields") or []:
+        target = str(field.get("target") or "")
+        suffix = target[len(input_key) + 1:] if target.startswith(input_key + ".") else ""
+        if suffix.isdigit():
+            extras.append((int(suffix), field))
+        else:
+            kept.append(field)
+    extras.sort(key=lambda item: item[0])
+    return {**(definition or {}), "fields": kept + [field for _, field in extras[:1]]}
+
+
 def mapped_targets(instance_id: str, device_id: Optional[str]) -> set:
     m = active_mapping(instance_id, device_id) if device_id else None
     if not m:

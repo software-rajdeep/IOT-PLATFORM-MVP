@@ -39,8 +39,11 @@ export async function renderGraphs(view, ctx, setCleanup, instanceId, mode = "se
     </div>`;
 
   const sizes = Object.fromEntries(widgets.map((w) => [w.widget_type, [w.default_w, w.default_h]]));
+  // The board is a live preview of the widgets, but not the run-mode dashboard: cards
+  // such as Calibration must not render action buttons without the dashboard's handlers.
   const board = mountBoard(document.getElementById("board"), opts.layout.widgets || [], {
-    editable: true, onChange: () => { document.getElementById("dirty").textContent = "unsaved changes"; },
+    editable: true, preview: true,
+    onChange: () => { document.getElementById("dirty").textContent = "unsaved changes"; },
   });
   view.querySelectorAll("[data-add]").forEach((b) => b.addEventListener("click", () => {
     const [w, h] = sizes[b.dataset.add] || [4, 2];

@@ -5,6 +5,7 @@ uvicorn
 psycopg2-binary
 bcrypt
 itsdangerous
+tzdata
 
 # Optional, only needed to talk to a REAL RS-485 sensor.
 # pyserial

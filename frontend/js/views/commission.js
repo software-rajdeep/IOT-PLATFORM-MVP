@@ -144,13 +144,15 @@ function oppositePanel(host, instanceId, onSaved) {
   }
 
   function renderSensors(data) {
-    const rows = (data.sensors || []).map((sensor) => `<tr>
+    // Opposite-side is a two-sensor layout: only A and B are ever shown.
+    const rows = (data.sensors || []).slice(0, 2).map((sensor) => `<tr>
       <td>${esc(sensor.label)}<div class="td-mono td-dim">${esc(sensor.key)}</div></td>
       <td class="td-r td-mono">${sensor.value == null ? "—" : Number(sensor.value).toFixed(3)}</td>
       <td class="td-r td-mono">${sensor.distance == null ? "—" : Number(sensor.distance).toFixed(3)}</td>
     </tr>`).join("");
     $("op-sensors").innerHTML = rows || `<tr><td colspan="3" class="td-dim">waiting for readings…</td></tr>`;
-    $("op-live").textContent = data.sensor_count ? `${data.sensor_count} sensor(s)` : "no data";
+    const sensorCount = Math.min(data.sensor_count || 0, 2);
+    $("op-live").textContent = sensorCount ? `${sensorCount} sensor(s)` : "no data";
 
     const gap = data.gap || {};
     const limits = data.limits || {};
@@ -161,7 +163,7 @@ function oppositePanel(host, instanceId, onSaved) {
         ? ` · object ${fmt(gap.object_thickness)} mm` : ""}${gap.tolerance != null
         ? ` · ±${fmt(gap.tolerance)} mm` : ""}<br/>limits ${range}
          ${data.calibrated_by ? `<br/>by ${esc(data.calibrated_by)} · ${esc(new Date(data.calibrated_at).toLocaleString())}` : ""}`
-      : data.sensor_count < 2
+      : sensorCount < 2
         ? "Map both sensor columns to use opposite-side mode"
         : "";
   }
@@ -242,6 +244,9 @@ export function calibrationPanel(host, instanceId, deviceId, onSaved, options = 
   if (options.mode === "gap" || options.mode === "auto_gap" || options.mode === "opposite") {
     return oppositePanel(host, instanceId, onSaved);
   }
+  let verifyTolerance = Number(options.verifyTolerance);
+  if (options.verifyTolerance == null || options.verifyTolerance === ""
+    || !Number.isFinite(verifyTolerance) || verifyTolerance < 0) verifyTolerance = 0.02;
   host.innerHTML = `
     <div class="live-read"><span class="k">Live displacement</span><span class="v" id="cw-live">—</span><span class="u">mm</span></div>
     <ol class="cal-steps">
@@ -258,13 +263,29 @@ export function calibrationPanel(host, instanceId, deviceId, onSaved, options = 
     <div id="cw-result" class="hint" style="margin-top:10px"></div>
     <div id="cw-verify" class="hidden" style="margin-top:14px">
       <b>Verify with a third piece</b>
-      <div class="cal-read-row" style="margin-top:6px"><input id="cw-tv" class="limit-input" type="number" step="any" placeholder="known mm" />
+      <div class="cal-read-row" style="margin-top:6px">
+        <input id="cw-tv" class="limit-input" type="number" step="any" placeholder="known mm" />
+        <input id="cw-tol" class="limit-input" type="number" step="any" min="0"
+          placeholder="acceptance ± mm" value="${verifyTolerance}" />
         <button type="button" class="btn secondary btn-sm" id="cw-vbtn">Verify now</button></div>
       <div id="cw-vres" class="hint"></div>
     </div>`;
   const $ = (id) => host.querySelector("#" + id);
   let live = null;
   let disposed = false;
+
+  // Re-read the saved acceptance band so reopening the dialog does not fall back to
+  // the default after the user changed it earlier in the session.
+  api.instance(instanceId).then((inst) => {
+    if (disposed) return;
+    const saved = (inst.config || {})["calibration.verify_tolerance_mm"];
+    const value = Number(saved);
+    if (saved != null && saved !== "" && Number.isFinite(value) && value >= 0) {
+      verifyTolerance = value;
+      const input = $("cw-tol");
+      if (input && document.activeElement !== input) input.value = value;
+    }
+  }).catch(() => {});
 
   async function poll() {
     try {
@@ -300,11 +321,20 @@ export function calibrationPanel(host, instanceId, deviceId, onSaved, options = 
   $("cw-vbtn").addEventListener("click", async () => {
     const t = parseFloat($("cw-tv").value);
     if (!Number.isFinite(t)) { toast("Enter the known thickness"); return; }
+    const tol = parseFloat($("cw-tol").value);
+    if (!Number.isFinite(tol) || tol < 0) { toast("Enter an acceptance tolerance of zero or greater"); return; }
     if (live == null) { toast("No live displacement available for verification"); return; }
     try {
-      const r = await api.verifyCalibration(instanceId, { known_thickness: t, displacement: live });
-      const ok = Math.abs(r.error_mm) <= 0.02;
-      $("cw-vres").innerHTML = `calculated ${fmt(r.calculated_thickness)} mm · error <span class="badge ${ok ? "good" : "warn"}">${r.error_mm > 0 ? "+" : ""}${fmt(r.error_mm)} mm</span>`;
+      const r = await api.verifyCalibration(instanceId, {
+        known_thickness: t, displacement: live, tolerance_mm: tol,
+      });
+      const limit = r.tolerance_mm ?? tol;
+      const ok = r.within_tolerance ?? (Math.abs(r.error_mm) <= limit);
+      $("cw-vres").innerHTML = `calculated ${fmt(r.calculated_thickness)} mm · error <span class="badge ${ok ? "good" : "warn"}">${r.error_mm > 0 ? "+" : ""}${fmt(r.error_mm)} mm</span> · limit ±${fmt(limit)} mm`;
+      if (tol !== verifyTolerance) {
+        verifyTolerance = tol;
+        api.updateInstance(instanceId, { config: { "calibration.verify_tolerance_mm": tol } }).catch(() => {});
+      }
     } catch (err) { toast(err.message); }
   });
 
@@ -347,7 +377,7 @@ export async function renderCommission(view, ctx, setCleanup, instanceId) {
     </div>`;
   let stop = null;
   if (needsCal) stop = calibrationPanel(document.getElementById("cal-host"), instanceId, instance.device_id, null,
-    { mode: calibrationMode });
+    { mode: calibrationMode, verifyTolerance: cfg["calibration.verify_tolerance_mm"] });
   setCleanup(() => stop && stop());
   async function saveFilter() {
     const windowSize = Number(document.getElementById("fw").value);

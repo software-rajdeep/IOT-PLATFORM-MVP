@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from ..db import execute, fetch_all, fetch_one, get_cursor
 from ..deps import get_current_user, require_company
-from ..services.calibration import compute_linear, current_displacement, latest_fields
+from ..services.calibration import compute_linear, current_displacement, latest_fields, verify_tolerance
 from ..services.dashboard import build_dashboard
 from ..services.devices import DEVICE_SELECT, load_device, resolve_plant, serialize_device
 from ..services.instances import get_instance, instance_device_ids, list_instances, load_config, serialize_instance, set_config
@@ -24,6 +24,7 @@ from ..services.opposite_calibration import (
     auto_gap_total,
     distance_mm,
     gap_distance,
+    limit_readings,
     object_thickness,
     tolerance,
     tolerance_limits,
@@ -301,6 +302,8 @@ def _calibration_live(row: dict) -> dict:
     input_key = _input_key(template)
     fields, ts = latest_fields(row["instance_id"], row.get("device_id"))
     readings = sensor_readings(fields, input_key)
+    if is_opposite:
+        readings = limit_readings(readings)
     keys = [key for key, _ in readings]
     ref_key = reference_key(config, keys)
     baselines = parse_baselines(config)
@@ -419,6 +422,9 @@ def reset_calibration(instance_id: str, user: dict = Depends(get_current_user)) 
                 "calibration.baselines", "calibration.reference_thickness",
                 "calibration.reference_sensor_key", "calibration.calibrated_at",
                 "calibration.calibrated_by", "calibration.mode",
+                "calibration.scale", "calibration.offset",
+                "calibration.reference_1_thickness", "calibration.reference_1_displacement",
+                "calibration.reference_2_thickness", "calibration.reference_2_displacement",
                 "calibration.gap_distance", "calibration.object_thickness",
                 "calibration.tolerance_mm",
             ]),
@@ -426,6 +432,9 @@ def reset_calibration(instance_id: str, user: dict = Depends(get_current_user)) 
     audit.log(user, "calibration.reset", "instance", instance_id,
               {key: before.get(key) for key in (
                   "calibration.baselines", "calibration.reference_thickness",
+                  "calibration.scale", "calibration.offset",
+                  "calibration.reference_1_thickness", "calibration.reference_1_displacement",
+                  "calibration.reference_2_thickness", "calibration.reference_2_displacement",
                   "calibration.gap_distance", "calibration.object_thickness",
                   "calibration.tolerance_mm",
                   "calibration.calibrated_at", "calibration.calibrated_by")}, None)
@@ -506,15 +515,16 @@ def calibrate_opposite(instance_id: str, body: OppositeCalibrateRequest,
     return {
         **updates,
         "captured_readings": captured,
-        "sensor_count": len(sensor_readings(
+        "sensor_count": len(limit_readings(sensor_readings(
             body.readings if body.readings is not None else latest_fields(
-                instance_id, row.get("device_id"))[0], input_key)),
+                instance_id, row.get("device_id"))[0], input_key))),
     }
 
 
 class VerifyCalibrationRequest(BaseModel):
     known_thickness: float
     displacement: Optional[float] = None
+    tolerance_mm: Optional[float] = None
 
 
 @router.post("/{instance_id}/calibration/verify")
@@ -533,11 +543,15 @@ def verify_calibration(instance_id: str, body: VerifyCalibrationRequest, user: d
     if displacement is None:
         raise HTTPException(status_code=400, detail="No live displacement available to verify.")
     calculated = scale * displacement + offset
+    error = calculated - body.known_thickness
+    tolerance = verify_tolerance(config, body.tolerance_mm)
     return {
         "known_thickness": body.known_thickness,
         "displacement": displacement,
         "calculated_thickness": round(calculated, 6),
-        "error_mm": round(calculated - body.known_thickness, 6),
+        "error_mm": round(error, 6),
+        "tolerance_mm": tolerance,
+        "within_tolerance": abs(error) <= tolerance,
     }
 
 

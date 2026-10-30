@@ -1,7 +1,57 @@
 """BLOCK 4/5 — calibration (two-point linear fit)."""
 from __future__ import annotations
 
+import math
+from typing import Optional
+
 from ..db import fetch_one
+from .sbs_calibration import baseline_complete
+
+DEFAULT_VERIFY_TOLERANCE_MM = 0.02
+
+
+def _finite(value) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def calibration_complete(config: dict, method: Optional[str],
+                         sensor_keys: Optional[list[str]] = None) -> bool:
+    """Whether the saved calibration contains everything the template's method needs."""
+    config = config or {}
+    if config.get("calibration.calibrated_at") in (None, ""):
+        return False
+    if method == "baseline":
+        return baseline_complete(config, sensor_keys or [])
+    if method in ("gap", "auto_gap"):
+        gap = config.get("calibration.gap_distance")
+        return _finite(gap) and float(gap) > 0
+    if method == "two_point":
+        return (_finite(config.get("calibration.scale"))
+                and _finite(config.get("calibration.offset")))
+    return True
+
+
+def verify_tolerance(config: dict, requested: Optional[float] = None) -> float:
+    """Acceptance band for the verification piece.
+
+    A per-call value wins; otherwise the instance's saved
+    ``calibration.verify_tolerance_mm``; otherwise the historical 0.02 mm default.
+    """
+    value = requested
+    if value is None:
+        value = (config or {}).get("calibration.verify_tolerance_mm")
+    if value in (None, ""):
+        value = DEFAULT_VERIFY_TOLERANCE_MM
+    try:
+        value = abs(float(value))
+    except (TypeError, ValueError):
+        value = DEFAULT_VERIFY_TOLERANCE_MM
+    if not math.isfinite(value):
+        value = DEFAULT_VERIFY_TOLERANCE_MM
+    return round(value, 6)
 
 
 def compute_linear(ref1_thickness: float, ref1_displacement: float,

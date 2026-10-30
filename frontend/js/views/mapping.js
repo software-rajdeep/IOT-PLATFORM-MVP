@@ -19,6 +19,8 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
   const unitDim = Object.fromEntries(units.map((u) => [u.unit_key, u.dimension]));
   const contract = info.contract || [];
   const roles = instance.template.field_roles || {};
+  // Opposite-side is exactly two sensors (A + B); no extra Sensor 3 is offered.
+  const opposite = info.sensor_layout === "opposite";
   const baseField = contract.find((c) => c.required && c.kind !== "text")
     || contract.find((c) => c.required) || contract[0] || {};
   const baseKey = baseField.key;
@@ -61,11 +63,14 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
     if (!baseKey) return [];
     const out = [];
     for (let n = 2; ; n += 1) {
+      if (opposite && out.length >= 1) break;
       const target = `${baseKey}.${n}`;
       const exists = ((def && def.fields) || []).some((f) => f.target === target);
       if (!exists) break;
       out.push(extraRow(def, target));
     }
+    // Opposite-side always has a B slot, even before it is mapped.
+    if (opposite && out.length === 0) out.push(extraRow(def, `${baseKey}.2`));
     return out;
   }
 
@@ -86,6 +91,7 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
       fields.push({ target: contract[i].key, path: r.path, transforms: transformsFor(r, contract[i]) });
     });
     if (baseKey) extras.forEach((r, i) => {
+      if (opposite && i > 0) return;
       if (!r.path) return;
       fields.push({ target: `${baseKey}.${i + 2}`, path: r.path, transforms: transformsFor(r, baseField) });
     });
@@ -175,12 +181,13 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
           ${baseKey ? `
           <div class="panel">
             <h3>Additional sensors</h3>
-            <p class="hint">Map extra sensor columns to the same reading (e.g. sensor_a, sensor_b, sensor_c).
-              They are stored with every measurement and listed on the dashboard.</p>
+            <p class="hint">${opposite
+              ? "Opposite-side uses two sensors: A (mapped above) and B (Sensor 2). Sensor 3 is not used."
+              : "Map extra sensor columns to the same reading (e.g. sensor_a, sensor_b, sensor_c). They are stored with every measurement and listed on the dashboard."}</p>
             <div class="table-wrap"><table class="map-table"><thead><tr>
               <th>Sensor</th><th>Source path</th><th>Unit sent</th><th>Scale</th><th>Offset</th><th class="td-r">Result</th><th></th>
             </tr></thead><tbody id="sensor-rows"></tbody></table></div>
-            <button class="btn secondary btn-sm" id="add-sensor" type="button">+ Add sensor</button>
+            ${opposite ? "" : `<button class="btn secondary btn-sm" id="add-sensor" type="button">+ Add sensor</button>`}
           </div>` : ""}
           <div class="panel">
             <h3>Preview through the whole pipeline</h3>
@@ -218,7 +225,7 @@ export async function renderMapping(view, ctx, setCleanup, instanceId) {
     const body = document.getElementById("sensor-rows");
     if (!body) return;
     body.innerHTML = extras.map((r, i) => `<tr data-i="${i}">
-      <td>Sensor ${i + 2}</td>
+      <td>${opposite ? "Sensor B" : `Sensor ${i + 2}`}</td>
       <td><select class="x-path">${pathOptions(r.path, false)}</select></td>
       <td><select class="x-unit">${unitOptions(baseField, r.from)}</select></td>
       <td><input class="x-scale mini-input" type="number" step="any" value="${esc(r.scale)}" /></td>
