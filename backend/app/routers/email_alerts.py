@@ -82,7 +82,20 @@ p {{ color: #555; line-height: 1.5; }}
 <div class="mark">{mark}</div>
 <h2>{html.escape(title)}</h2>
 <p>{html.escape(message)}</p>
-</div></body></html>"""
+<p style="margin-top:18px"><a href="/#/apps">Back to the app</a></p>
+</div>
+<script>
+  (function () {{
+    var ret = null;
+    try {{ ret = sessionStorage.getItem("ucap_oauth_return"); }} catch (e) {{}}
+    var target = "/" + (ret || "#/apps");
+    setTimeout(function () {{
+      if (window.opener && !window.opener.closed) {{ window.close(); }}
+      else {{ window.location.href = target; }}
+    }}, 1500);
+  }})();
+</script>
+</body></html>"""
 
 
 def _callback(request: Request) -> HTMLResponse:

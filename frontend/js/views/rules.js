@@ -203,43 +203,20 @@ export async function renderRules(view, ctx, setCleanup, instanceId) {
 
   async function connectGoogle() {
     if (!emailCfg) return;
-    const width = 500;
-    const height = 600;
-    const left = window.screenX + (window.outerWidth - width) / 2;
-    const top = window.screenY + (window.outerHeight - height) / 2;
-    const popup = window.open("", "google-oauth", `width=${width},height=${height},left=${left},top=${top}`);
-    setEmailStatus("Opening Google sign-in...");
-    let auth_url;
+    setEmailStatus("Redirecting to Google...");
     try {
-      ({ auth_url } = await api.emailAlertAuthUrl());
+      const { auth_url } = await api.emailAlertAuthUrl();
+      try {
+        sessionStorage.setItem("ucap_oauth_return", location.hash || "#/apps");
+      } catch { /* private mode: the callback falls back to #/apps */ }
+      // Redirect this tab instead of opening a popup. Popup blockers and
+      // extensions can silently swallow window.open(), which made the button
+      // look dead on some browsers/domains.
+      window.location.href = auth_url;
     } catch (e) {
-      if (popup) popup.close();
+      setEmailStatus(e.message, "bad");
       throw e;
     }
-    if (popup) popup.location.href = auth_url;
-    else window.open(auth_url, "google-oauth", `width=${width},height=${height},left=${left},top=${top}`);
-    setEmailStatus("Waiting for Google authentication...");
-
-    let attempts = 0;
-    const timer = setInterval(async () => {
-      attempts += 1;
-      try {
-        const config = await api.emailAlertConfig();
-        if (config.gmail_authenticated) {
-          clearInterval(timer);
-          emailCfg = config;
-          const auth = document.getElementById("email-auth");
-          if (auth) auth.innerHTML = emailAuthMarkup(config);
-          bindEmailAuth();
-          setEmailStatus("Google authentication successful.", "good");
-          if (popup) popup.close();
-        }
-      } catch { /* keep polling */ }
-      if (attempts >= 120) {
-        clearInterval(timer);
-        setEmailStatus("Authentication timed out. Please try again.", "bad");
-      }
-    }, 1000);
   }
 
   async function testEmail() {
